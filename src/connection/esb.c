@@ -29,6 +29,7 @@
 #include <zephyr/sys/crc.h>
 
 #include "esb.h"
+#include "cmd_queue.h"
 
 static struct esb_payload rx_payload;
 //static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
@@ -37,8 +38,10 @@ static struct esb_payload tx_payload_pair = ESB_CREATE_PAYLOAD(0,
 														  0, 0, 0, 0, 0, 0, 0, 0);
 //static struct esb_payload tx_payload_timer = ESB_CREATE_PAYLOAD(0,
 //														  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+// Sync packet extended to 12 bytes: LED clock (2B) + RFT command slot (10B).
+// See cmd_queue.h for packet layout.
 static struct esb_payload tx_payload_sync = ESB_CREATE_PAYLOAD(0,
-														  0, 0, 0, 0);
+														  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
 uint8_t pairing_buf[8] = {0};
 static uint8_t discovered_trackers[MAX_TRACKERS] = {0};
@@ -515,8 +518,15 @@ void esb_write_sync(uint16_t led_clock)
 	if (!esb_initialized || !esb_paired)
 		return;
 	tx_payload_sync.noack = false;
+	tx_payload_sync.length = 12;
 	tx_payload_sync.data[0] = (led_clock >> 8) & 255;
 	tx_payload_sync.data[1] = led_clock & 255;
+	// Pop one queued RFT command (round-robin across paired trackers) and pack
+	// it into bytes [2..11]. RFT_CMD_NO_TARGET in [2] = no command this slot.
+	rft_cmd_t cmd;
+	uint8_t target = rft_cmd_pop_next(&cmd);
+	rft_cmd_pack(target, target == RFT_CMD_NO_TARGET ? NULL : &cmd,
+	             &tx_payload_sync.data[2]);
 	esb_write_payload(&tx_payload_sync);
 }
 

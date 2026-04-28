@@ -24,6 +24,10 @@
 #include "system/system.h"
 #include "build_defines.h"
 #include "parse_args.h"
+#include "connection/cmd_queue.h"
+
+#include <stdlib.h>  /* strtof */
+#include <math.h>    /* roundf */
 
 #define USB DT_NODELABEL(usbd)
 #if DT_NODE_HAS_STATUS(USB, okay)
@@ -166,6 +170,22 @@ static inline void strtolower(char *str) {
 	}
 }
 
+/* RFT: enqueue a mag-cal command for one tracker (or all). Returns count of
+ * trackers the command was queued for, or -1 on bad input. */
+static int rft_enqueue_for(const char *id_str, const rft_cmd_t *cmd)
+{
+	if (id_str == NULL) return -1;
+	if (strcmp(id_str, "all") == 0) {
+		int n = 0;
+		for (uint8_t i = 0; i < stored_trackers; i++)
+			if (rft_cmd_push(i, cmd)) n++;
+		return n;
+	}
+	int id = (int)parse_i32(id_str, 10);
+	if (id < 0 || id >= stored_trackers) return -1;
+	return rft_cmd_push((uint8_t)id, cmd) ? 1 : 0;
+}
+
 static void print_help(void)
 {
 	printk("\nhelp                         Display this help text\n");
@@ -179,6 +199,9 @@ static void print_help(void)
 	printk("pair                         Enter pairing mode\n");
 	printk("exit                         Exit pairing mode\n");
 	printk("clear                        Clear stored devices\n");
+	printk("\nset_mag_bias <id|all> <x> <y> <z>  Set mag bias (Gauss) on tracker\n");
+	printk("clear_mag_bias <id|all>      Clear mag bias on tracker (NVS too)\n");
+	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
 #if DFU_EXISTS
 	printk("\ndfu                          Enter DFU bootloader\n");
 #endif
@@ -214,7 +237,7 @@ static void console_thread(void)
 	while (1) {
 		char *line = console_getline();
 
-		char* argv[5] = {NULL}; // command and 4 args
+		char* argv[6] = {NULL}; // command and 5 args (e.g. set_mag_bias <id> <x> <y> <z>)
 		size_t argc = parse_args(line, argv, ARRAY_SIZE(argv));
 		if(argc == 0)
 			continue;
@@ -291,6 +314,40 @@ static void console_thread(void)
 		else if (strcmp(line, command_meow) == 0)
 		{
 			print_meow();
+		}
+		else if (strcmp(argv[0], "set_mag_bias") == 0)
+		{
+			if (argc != 5) { printk("Usage: set_mag_bias <id|all> <x> <y> <z>\n"); continue; }
+			float x = strtof(argv[2], NULL);
+			float y = strtof(argv[3], NULL);
+			float z = strtof(argv[4], NULL);
+			/* Q11 fixed: 1.0G = 2048, range ±16G */
+			int16_t qx = (int16_t)roundf(x * 2048.0f);
+			int16_t qy = (int16_t)roundf(y * 2048.0f);
+			int16_t qz = (int16_t)roundf(z * 2048.0f);
+			rft_cmd_t cmd = { .type = RFT_CMD_SET_MAG_BIAS };
+			memcpy(&cmd.data[0], &qx, 2);
+			memcpy(&cmd.data[2], &qy, 2);
+			memcpy(&cmd.data[4], &qz, 2);
+			int n = rft_enqueue_for(argv[1], &cmd);
+			if (n < 0) printk("Bad target id\n");
+			else printk("Queued set_mag_bias for %d tracker(s)\n", n);
+		}
+		else if (strcmp(argv[0], "clear_mag_bias") == 0)
+		{
+			if (argc != 2) { printk("Usage: clear_mag_bias <id|all>\n"); continue; }
+			rft_cmd_t cmd = { .type = RFT_CMD_CLEAR_MAG_BIAS };
+			int n = rft_enqueue_for(argv[1], &cmd);
+			if (n < 0) printk("Bad target id\n");
+			else printk("Queued clear_mag_bias for %d tracker(s)\n", n);
+		}
+		else if (strcmp(argv[0], "mag_recal") == 0)
+		{
+			if (argc != 2) { printk("Usage: mag_recal <id|all>\n"); continue; }
+			rft_cmd_t cmd = { .type = RFT_CMD_MAG_RECAL };
+			int n = rft_enqueue_for(argv[1], &cmd);
+			if (n < 0) printk("Bad target id\n");
+			else printk("Queued mag_recal for %d tracker(s)\n", n);
 		}
 		else
 		{
