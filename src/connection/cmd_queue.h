@@ -28,10 +28,13 @@
 #define RFT_CMD_QUEUE_DEPTH 4
 
 /* Command types — must match tracker firmware */
-#define RFT_CMD_NONE          0
-#define RFT_CMD_SET_MAG_BIAS  1  /* payload: 3 × int16 Q11 (Gauss) */
-#define RFT_CMD_CLEAR_MAG_BIAS 2 /* payload: zeros */
-#define RFT_CMD_MAG_RECAL     3  /* payload: zeros (RAM-only reset) */
+#define RFT_CMD_NONE           0
+#define RFT_CMD_SET_MAG_BIAS   1  /* payload: 3 × int16 Q11 (Gauss) */
+#define RFT_CMD_CLEAR_MAG_BIAS 2  /* payload: zeros */
+#define RFT_CMD_MAG_RECAL      3  /* payload: zeros (RAM-only reset) */
+#define RFT_CMD_STREAM_RAW_MAG 4  /* payload[0]: 0=off, 1=on. When on, the
+                                   * tracker emits packet 8 (raw mag + bias)
+                                   * at mag sample rate. Default: off. */
 
 #define RFT_CMD_NO_TARGET     0xFF
 
