@@ -30,6 +30,7 @@
 
 #include "esb.h"
 #include "cmd_queue.h"
+#include "timer.h"
 
 static struct esb_payload rx_payload;
 //static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
@@ -245,12 +246,16 @@ static const uint8_t discovery_addr_prefix[8] = {0xFE, 0xFF, 0x29, 0x27, 0x09, 0
 
 static uint8_t base_addr_0[4], base_addr_1[4], addr_prefix[8] = {0};
 
-static bool esb_initialized = false;
+// RFT: not static — sync_thread in timer.c reads this to gate its PRX↔PTX swap.
+bool esb_initialized = false;
 
 int esb_initialize(bool tx)
 {
-	if (esb_initialized)
-		LOG_WRN("ESB already initialized");
+	// RFT: sync_thread reconfigures (PRX↔PTX) on every cycle; the upstream
+	// esb_disable() (nrf ESB lib) does not clear our esb_initialized flag,
+	// so this used to flood "ESB already initialized" warnings. Just clear
+	// it here — esb_init() below reconfigures the radio either way.
+	esb_initialized = false;
 	int err;
 
 	struct esb_config config = ESB_DEFAULT_CONFIG;
@@ -286,7 +291,8 @@ int esb_initialize(bool tx)
 //		config.use_fast_ramp_up = true;
 	}
 
-	LOG_INF("Initializing ESB, %sX mode", tx ? "T" : "R");
+	// RFT: was LOG_INF — at 20 Hz this floods the console. Bumped to DBG.
+	LOG_DBG("Initializing ESB, %sX mode", tx ? "T" : "R");
 	err = esb_init(&config);
 
 	if (!err)
@@ -362,7 +368,8 @@ inline void esb_set_addr_paired(void)
 }
 
 static bool esb_pairing = false;
-static bool esb_paired = false;
+// RFT: not static — sync_thread in timer.c reads this.
+bool esb_paired = false;
 
 void esb_add_pair(uint64_t addr, bool checksum)
 {
@@ -512,22 +519,58 @@ void esb_clear(void)
 	esb_reset_pair();
 }
 
-// TODO:
+// RFT: queue the next sync as an ACK payload.
+//
+// Receiver stays in PRX. ESB's auto-ack engine attaches the queued payload
+// to the next outgoing ACK frame on a *matching pipe*. All trackers send on
+// pipe 1 (see tracker firmware's connection.c — tx_payload.pipe = 1 with
+// tracker_id encoded in data[1]), so we queue ACK payloads on pipe 1.
+//
+// CONFIG_ESB_TX_FIFO_SIZE = 1, so this FIFO holds a single pending entry.
+// If we call faster than trackers transmit, we get -ENOMEM until the next
+// tracker packet drains it. That's expected and harmless. Counts of
+// success vs ENOMEM are surfaced in the 1-Hz diagnostic.
 void esb_write_sync(uint16_t led_clock)
 {
 	if (!esb_initialized || !esb_paired)
 		return;
+	tx_payload_sync.pipe = 1; // all trackers TX on pipe 1
 	tx_payload_sync.noack = false;
 	tx_payload_sync.length = 12;
 	tx_payload_sync.data[0] = (led_clock >> 8) & 255;
 	tx_payload_sync.data[1] = led_clock & 255;
-	// Pop one queued RFT command (round-robin across paired trackers) and pack
-	// it into bytes [2..11]. RFT_CMD_NO_TARGET in [2] = no command this slot.
 	rft_cmd_t cmd;
-	uint8_t target = rft_cmd_pop_next(&cmd);
-	rft_cmd_pack(target, target == RFT_CMD_NO_TARGET ? NULL : &cmd,
+	uint8_t target = rft_cmd_peek_next(&cmd);
+	uint8_t flags = rft_get_global_flags();
+	rft_cmd_pack(flags, target, target == RFT_CMD_NO_TARGET ? NULL : &cmd,
 	             &tx_payload_sync.data[2]);
-	esb_write_payload(&tx_payload_sync);
+	int err = esb_write_payload(&tx_payload_sync);
+
+	// Only consume (decrement retry counter / drop) on successful queue.
+	// If -ENOMEM, the ACK FIFO is still full from the previous write —
+	// next tick we'll peek the same cmd and try again.
+	if (err == 0 && target != RFT_CMD_NO_TARGET) {
+		rft_cmd_consume(target);
+	}
+
+	// Diag: success / busy / cmd-issued counts.
+	static volatile uint32_t ok_count = 0;
+	static volatile uint32_t busy_count = 0;
+	static volatile uint32_t cmd_tx_count = 0;
+	static int64_t last_log_ms = 0;
+	if (err == 0) ok_count++;
+	else if (err == -ENOMEM) busy_count++;
+	if (err == 0 && target != RFT_CMD_NO_TARGET) cmd_tx_count++;
+	int64_t now_ms = k_uptime_get();
+	if (now_ms - last_log_ms > 1000) {
+		last_log_ms = now_ms;
+		printk("RFT_RX: ack_ok/s=%u busy/s=%u cmd_tx/s=%u last_err=%d paired=%d init=%d\n",
+		       ok_count, busy_count, cmd_tx_count, err,
+		       (int)esb_paired, (int)esb_initialized);
+		ok_count = 0;
+		busy_count = 0;
+		cmd_tx_count = 0;
+	}
 }
 
 // TODO:
@@ -566,6 +609,11 @@ static void esb_thread(void)
 		esb_initialize(false);
 		esb_start_rx();
 	}
+
+	// RFT: kick off the periodic sync timer. Drives esb_write_sync which
+	// delivers RFT_CMD commands queued via cmd_queue. Disabled for now —
+	// nrfx_timer setup needs more work (boot crashes), revisit with k_work.
+	// timer_init();
 
 	while (1)
 	{

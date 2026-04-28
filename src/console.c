@@ -202,7 +202,7 @@ static void print_help(void)
 	printk("\nset_mag_bias <id|all> <x> <y> <z>  Set mag bias (Gauss) on tracker\n");
 	printk("clear_mag_bias <id|all>      Clear mag bias on tracker (NVS too)\n");
 	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
-	printk("stream_raw_mag <id|all> <0|1>  Toggle packet 8 (raw mag + bias) streaming\n");
+	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
 #if DFU_EXISTS
 	printk("\ndfu                          Enter DFU bootloader\n");
 #endif
@@ -350,16 +350,16 @@ static void console_thread(void)
 			if (n < 0) printk("Bad target id\n");
 			else printk("Queued mag_recal for %d tracker(s)\n", n);
 		}
-		else if (strcmp(argv[0], "stream_raw_mag") == 0)
+		else if (strcmp(argv[0], "mag_stream") == 0)
 		{
-			if (argc != 3) { printk("Usage: stream_raw_mag <id|all> <0|1>\n"); continue; }
-			int onoff = (int)parse_i32(argv[2], 10);
+			/* Global flag — every paired tracker streams in lock-step,
+			 * no targeting. The flag rides every sync packet so all
+			 * trackers see the new state within ~20 ms. */
+			if (argc != 2) { printk("Usage: mag_stream <0|1>\n"); continue; }
+			int onoff = (int)parse_i32(argv[1], 10);
 			if (onoff != 0 && onoff != 1) { printk("Bad on/off (use 0 or 1)\n"); continue; }
-			rft_cmd_t cmd = { .type = RFT_CMD_STREAM_RAW_MAG };
-			cmd.data[0] = (uint8_t)onoff;
-			int n = rft_enqueue_for(argv[1], &cmd);
-			if (n < 0) printk("Bad target id\n");
-			else printk("Queued stream_raw_mag=%d for %d tracker(s)\n", onoff, n);
+			rft_set_global_flag(RFT_FLAG_STREAM_RAW_MAG, onoff != 0);
+			printk("mag_stream=%d (broadcast to all)\n", onoff);
 		}
 		else
 		{
