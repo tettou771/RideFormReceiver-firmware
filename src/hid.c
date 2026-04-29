@@ -355,7 +355,11 @@ K_THREAD_DEFINE(usb_init_thread_id, 256, usb_init_thread, NULL, NULL, NULL, 6, 0
 void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 {
 	memcpy(&report.data, data, sizeof(report)); // all data can be passed through
-	if (data[0] != 1 && data[0] != 4) // packet 1 and 4 are full precision quat and accel/mag, no room for rssi
+	// Packet 1 and 4 are full precision quat+accel/mag, no room for rssi.
+	// RFT pkt 9 carries mag_axes_mode in byte 15 — preserve it. RSSI for
+	// pkt 9 isn't useful (the diagnostic stream is already gated by pkt 4
+	// which has its own signal-quality semantics).
+	if (data[0] != 1 && data[0] != 4 && data[0] != 9)
 		report.data[15] = rssi;
 	// Get current FIFO status atomically
 	size_t write_idx = (size_t)atomic_get(&report_write_index);
