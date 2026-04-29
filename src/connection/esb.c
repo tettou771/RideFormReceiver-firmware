@@ -46,6 +46,14 @@ static struct esb_payload tx_payload_sync = ESB_CREATE_PAYLOAD(0,
 
 uint8_t pairing_buf[8] = {0};
 static uint8_t discovered_trackers[MAX_TRACKERS] = {0};
+
+/* RFT diagnostic: per-tracker packet RX counts. Reset each second by the
+ * stats logger so the printout reflects pps. Helps tell whether a
+ * "disconnected" tracker (PC sees no packets) is actually missing at the
+ * radio level or just not reaching HID. */
+static volatile uint32_t rft_rx_count[MAX_TRACKERS] = {0};
+static volatile uint32_t rft_rx_pretrig[MAX_TRACKERS] = {0};  /* pre-discovery filter drops */
+static volatile uint32_t rft_hid_count[MAX_TRACKERS] = {0};   /* successful HID forwards */
 uint8_t sequences[256] = {0};
 int64_t last_seq_time[256] = {[0 ... 255] = -1000};
 uint16_t packets_count[256] = {0};
@@ -178,14 +186,17 @@ void event_handler(struct esb_evt const *event)
 				uint8_t imu_id = rx_payload.data[1];
 				if (imu_id >= stored_trackers) // not a stored tracker
 					continue;
+				if (imu_id < MAX_TRACKERS) rft_rx_count[imu_id]++;
 				if (discovered_trackers[imu_id] < DETECTION_THRESHOLD) // garbage filtering of nonexistent tracker
 				{
 					discovered_trackers[imu_id]++;
+					if (imu_id < MAX_TRACKERS) rft_rx_pretrig[imu_id]++;
 					continue;
 				}
 				if (rx_payload.data[0] > 223) // reserved for receiver only
 					break;
 				hid_write_packet_n(rx_payload.data, rx_payload.rssi); // write to hid endpoint
+				if (imu_id < MAX_TRACKERS) rft_hid_count[imu_id]++;
 				break;
 			default:
 				LOG_ERR("Wrong packet length: %d", rx_payload.length);
@@ -570,6 +581,28 @@ void esb_write_sync(uint16_t led_clock)
 		ok_count = 0;
 		busy_count = 0;
 		cmd_tx_count = 0;
+
+		/* Per-tracker RX / HID-forward counts (pps). Helps tell which
+		 * tracker_id is silent at the radio level vs. silent only on the
+		 * HID side. Print only if at least one tracker is paired so
+		 * unpaired-receiver runs stay quiet. */
+		if (stored_trackers > 0) {
+			char buf[256];
+			int p = 0;
+			p += snprintf(buf + p, sizeof(buf) - p, "RFT_RX_PER:");
+			for (int i = 0; i < stored_trackers && p < (int)sizeof(buf) - 16; i++) {
+				p += snprintf(buf + p, sizeof(buf) - p,
+				              " t%d=%u/%u", i,
+				              (unsigned)rft_hid_count[i],
+				              (unsigned)rft_rx_count[i]);
+			}
+			printk("%s\n", buf);
+			for (int i = 0; i < MAX_TRACKERS; i++) {
+				rft_rx_count[i] = 0;
+				rft_hid_count[i] = 0;
+				rft_rx_pretrig[i] = 0;
+			}
+		}
 	}
 }
 
