@@ -5,6 +5,10 @@
 #
 cmake_minimum_required(VERSION 3.20.0)
 
+# RFT: pick up application-local board definitions (e.g. seeed/wio_bg770a)
+# in addition to the ones shipped with Zephyr / NCS.
+list(APPEND BOARD_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(NONE)
 

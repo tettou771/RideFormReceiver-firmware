@@ -1,0 +1,9 @@
+# Copyright (c) Seeed K.K.
+# SPDX-License-Identifier: Apache-2.0
+
+board:
+  name: wio_bg770a
+  full_name: Wio BG770A
+  vendor: seeed
+  socs:
+  - name: nrf52840

@@ -21,6 +21,9 @@
 	THE SOFTWARE.
 */
 #include "globals.h"
+#include "hid.h"
+
+#if IS_ENABLED(CONFIG_USB_DEVICE_HID)
 
 #include <zephyr/kernel.h>
 #include <zephyr/usb/usb_device.h>
@@ -393,3 +396,17 @@ void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 	if (write_idx == MAX_TRACKERS) write_idx = 0;
 	atomic_set(&report_write_index, write_idx);
 }
+
+#else /* !CONFIG_USB_DEVICE_HID */
+
+// RFT: Wio BG770A and other LTE-only builds drop the HID interface. esb.c
+// still calls hid_write_packet_n unconditionally; provide a no-op so the link
+// succeeds. The LTE forwarder hooks the same packet stream via its own
+// callback (see src/connection/modem.c).
+void hid_write_packet_n(uint8_t *data, uint8_t rssi)
+{
+	(void)data;
+	(void)rssi;
+}
+
+#endif /* CONFIG_USB_DEVICE_HID */

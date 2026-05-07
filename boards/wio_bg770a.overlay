@@ -1,0 +1,33 @@
+/*
+ * RFT: Wio BG770A application overlay.
+ *
+ * - Disable Zephyr modem subsystem binding on uart1; we drive AT directly
+ *   from src/connection/modem.c. Keeps uart1 itself enabled with HW flow
+ *   control to BG770A-GL.
+ * - Enable timer1 for the periodic ESB sync (esb.c).
+ * - LED is via the board's `led0` GPIO alias; no PWM color LED on this
+ *   board, so we only define `led-gpios` mirror for the led module's
+ *   `zephyr,user` lookup path.
+ */
+
+&modem {
+	status = "disabled";
+};
+
+&timer1 {
+	status = "okay";
+};
+
+/ {
+	zephyr,user {
+		led-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&cryptocell {
+	status = "disabled";
+};
+
+&nfct {
+	status = "disabled";
+};

@@ -1,0 +1,17 @@
+# Copyright (c) Seeed K.K.
+# SPDX-License-Identifier: Apache-2.0
+
+identifier: wio_bg770a
+name: Wio BG770A
+type: mcu
+arch: arm
+ram: 256
+flash: 1024
+toolchain:
+  - zephyr
+  - gnuarmemb
+supported:
+  - gpio
+  - usbd
+  - netif:openthread
+vendor: seeed

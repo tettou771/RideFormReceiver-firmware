@@ -1,0 +1,10 @@
+# Wio BG770A board configuration
+
+# Copyright (c) Seeed K.K.
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_WIO_BG770A
+
+source "boards/common/usb/Kconfig.cdc_acm_serial.defconfig"
+
+endif # BOARD_WIO_BG770A
