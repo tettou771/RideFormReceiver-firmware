@@ -21,6 +21,12 @@
 / {
 	zephyr,user {
 		led-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+
+		/* RFT modem control lines, originally exposed by the disabled
+		 * `&modem` node above. We drive AT directly so they live on
+		 * zephyr,user instead of a Zephyr-modem-driver binding. */
+		modem-power-gpios = <&gpio1 1 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+		modem-reset-gpios = <&gpio1 15 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
 	};
 };
 

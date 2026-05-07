@@ -31,6 +31,7 @@
 #include "esb.h"
 #include "cmd_queue.h"
 #include "timer.h"
+#include "modem.h"
 
 static struct esb_payload rx_payload;
 //static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
@@ -196,6 +197,7 @@ void event_handler(struct esb_evt const *event)
 				if (rx_payload.data[0] > 223) // reserved for receiver only
 					break;
 				hid_write_packet_n(rx_payload.data, rx_payload.rssi); // write to hid endpoint
+				modem_enqueue_tracker_packet(rx_payload.data); // forward over LTE (no-op on USB-only boards)
 				if (imu_id < MAX_TRACKERS) rft_hid_count[imu_id]++;
 				break;
 			default:

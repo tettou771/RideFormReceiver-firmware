@@ -25,6 +25,7 @@
 #include "build_defines.h"
 #include "parse_args.h"
 #include "connection/cmd_queue.h"
+#include "connection/modem.h"
 
 #include <stdlib.h>  /* strtof */
 #include <math.h>    /* roundf */
@@ -203,6 +204,15 @@ static void print_help(void)
 	printk("clear_mag_bias <id|all>      Clear mag bias on tracker (NVS too)\n");
 	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
 	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
+	printk("\nmodem status                 Show modem state and MQTT settings\n");
+	printk("modem start | stop           Bring up / tear down LTE link\n");
+	printk("modem at <command>           Raw AT passthrough (debug)\n");
+	printk("modem apn <name>             Set APN (NVS)\n");
+	printk("modem broker <host> <port>   Set MQTT broker (NVS)\n");
+	printk("modem client <id>            Set MQTT client id (NVS)\n");
+	printk("modem topic <topic>          Set MQTT publish topic (NVS)\n");
+	printk("modem user <user>            Set MQTT username (empty clears)\n");
+	printk("modem pass <pass>            Set MQTT password (empty clears)\n");
 #if DFU_EXISTS
 	printk("\ndfu                          Enter DFU bootloader\n");
 #endif
@@ -360,6 +370,56 @@ static void console_thread(void)
 			if (onoff != 0 && onoff != 1) { printk("Bad on/off (use 0 or 1)\n"); continue; }
 			rft_set_global_flag(RFT_FLAG_STREAM_RAW_MAG, onoff != 0);
 			printk("mag_stream=%d (broadcast to all)\n", onoff);
+		}
+		else if (strcmp(argv[0], "modem") == 0)
+		{
+			/* RFT: BG770A modem control (wio_bg770a board only — stubs
+			 * elsewhere). Subcommands mirror QMTOPEN/QMTCONN params. */
+			if (argc < 2) {
+				printk("Usage: modem status|start|stop|at|apn|broker|client|topic|user|pass ...\n");
+				continue;
+			}
+			strtolower(argv[1]);
+			if (strcmp(argv[1], "status") == 0) {
+				modem_console_status();
+			} else if (strcmp(argv[1], "start") == 0) {
+				modem_request_start();
+				printk("modem start requested\n");
+			} else if (strcmp(argv[1], "stop") == 0) {
+				modem_request_stop();
+				printk("modem stopped\n");
+			} else if (strcmp(argv[1], "at") == 0) {
+				if (argc < 3) { printk("Usage: modem at <cmd>\n"); continue; }
+				/* Re-join argv[2..] in case the user typed spaces. */
+				char buf[160] = {0};
+				for (int i = 2; i < (int)argc; i++) {
+					strncat(buf, argv[i], sizeof(buf) - strlen(buf) - 1);
+					if (i + 1 < (int)argc) strncat(buf, " ", sizeof(buf) - strlen(buf) - 1);
+				}
+				modem_console_at(buf);
+			} else if (strcmp(argv[1], "apn") == 0) {
+				modem_console_set_apn(argc >= 3 ? argv[2] : "");
+				printk("apn set\n");
+			} else if (strcmp(argv[1], "broker") == 0) {
+				if (argc < 4) { printk("Usage: modem broker <host> <port>\n"); continue; }
+				int port = (int)parse_i32(argv[3], 10);
+				modem_console_set_broker(argv[2], (uint16_t)port);
+				printk("broker set\n");
+			} else if (strcmp(argv[1], "client") == 0) {
+				modem_console_set_client(argc >= 3 ? argv[2] : "");
+				printk("client set\n");
+			} else if (strcmp(argv[1], "topic") == 0) {
+				modem_console_set_topic(argc >= 3 ? argv[2] : "");
+				printk("topic set\n");
+			} else if (strcmp(argv[1], "user") == 0) {
+				modem_console_set_user(argc >= 3 ? argv[2] : "");
+				printk("user set\n");
+			} else if (strcmp(argv[1], "pass") == 0) {
+				modem_console_set_pass(argc >= 3 ? argv[2] : "");
+				printk("pass set\n");
+			} else {
+				printk("Unknown modem subcommand\n");
+			}
 		}
 		else
 		{
