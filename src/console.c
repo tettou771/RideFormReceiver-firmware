@@ -204,6 +204,7 @@ static void print_help(void)
 	printk("clear_mag_bias <id|all>      Clear mag bias on tracker (NVS too)\n");
 	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
 	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
+	printk("rate <id|all> <Hz>           Cap tracker TX rate (RAM only, 0=default)\n");
 	printk("\nmodem status                 Show modem state and MQTT settings\n");
 	printk("modem start | stop           Bring up / tear down LTE link\n");
 	printk("modem at <command>           Raw AT passthrough (debug)\n");
@@ -370,6 +371,19 @@ static void console_thread(void)
 			if (onoff != 0 && onoff != 1) { printk("Bad on/off (use 0 or 1)\n"); continue; }
 			rft_set_global_flag(RFT_FLAG_STREAM_RAW_MAG, onoff != 0);
 			printk("mag_stream=%d (broadcast to all)\n", onoff);
+		}
+		else if (strcmp(argv[0], "rate") == 0)
+		{
+			/* RFT: cap a tracker's TX rate (RAM only, reverts on power
+			 * cycle). 0 means "back to firmware default". */
+			if (argc != 3) { printk("Usage: rate <id|all> <Hz 0-255>\n"); continue; }
+			int hz = (int)parse_i32(argv[2], 10);
+			if (hz < 0 || hz > 255) { printk("Hz out of range (0-255)\n"); continue; }
+			rft_cmd_t cmd = { .type = RFT_CMD_SET_MAX_RATE_HZ };
+			cmd.data[0] = (uint8_t)hz;
+			int n = rft_enqueue_for(argv[1], &cmd);
+			if (n < 0) printk("Bad target id\n");
+			else printk("Queued rate=%dHz for %d tracker(s)\n", hz, n);
 		}
 		else if (strcmp(argv[0], "modem") == 0)
 		{

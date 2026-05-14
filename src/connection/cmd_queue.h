@@ -46,6 +46,10 @@
 /* RFT_CMD_STREAM_RAW_MAG (=4) was retired — moved to RFT_FLAG_STREAM_RAW_MAG.
  * Don't reuse the value for a different command until tracker firmware is
  * updated past commit a04f3a6 to be safe. */
+#define RFT_CMD_SET_MAX_RATE_HZ 5 /* payload: uint8 rate Hz in [0..255],
+                                   * 0 means "back to firmware default".
+                                   * RAM only on tracker side — a power
+                                   * cycle reverts to the built-in rate. */
 
 #define RFT_CMD_NO_TARGET     0xFF
 

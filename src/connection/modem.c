@@ -273,23 +273,38 @@ static void cfg_load(void)
 	if (cfg.port == 0) cfg.port = 1883;
 }
 
-/* ---- Tracker packet aggregation -------------------------------------- */
-
+/* ---- Tracker packet snapshot ---------------------------------------- */
+/* "Latest snapshot per tracker" rather than a FIFO of every ESB packet.
+ * Each tracker overwrites its own slot at receive time; the publish
+ * worker drains the whole snapshot at a fixed 30 Hz, serialising one
+ * 16-byte slot per id with a valid bit set, and packs them back to back
+ * into one MQTT message. Effects:
+ *   - publish cadence becomes wall-clock (≈30 fps) instead of ESB-driven,
+ *     so the receiving Deck's sample-rate math stays sane
+ *   - same id never appears twice in one publish, halving bandwidth
+ *     vs the old "every ESB packet through" path
+ *   - trackers that didn't send during a window simply don't appear in
+ *     that window — the Deck's isTimedOut(3s) handles the disappearance
+ *
+ * MDM_SNAP_MAX caps the id range we track. 32 is plenty for the 10-
+ * tracker rig; using a uint32_t valid bitmap lets us atomic_or in the
+ * ESB receive callback without a lock. */
 #define MDM_PKT_BYTES   16
-#define MDM_PKT_RING    256  /* fits ~33ms of 8 trackers @ ~50pps each */
+#define MDM_SNAP_MAX    32
 
-static uint8_t agg_buf[MDM_PKT_RING][MDM_PKT_BYTES];
-static atomic_t agg_w = ATOMIC_INIT(0);
-static atomic_t agg_r = ATOMIC_INIT(0);
+static uint8_t   snap_pkt[MDM_SNAP_MAX][MDM_PKT_BYTES];
+static atomic_t  snap_valid = ATOMIC_INIT(0);
 
 bool modem_enqueue_tracker_packet(const uint8_t *pkt16)
 {
-	int w = atomic_get(&agg_w);
-	int r = atomic_get(&agg_r);
-	int next = (w + 1) % MDM_PKT_RING;
-	if (next == r) return false; /* full, drop */
-	memcpy(agg_buf[w], pkt16, MDM_PKT_BYTES);
-	atomic_set(&agg_w, next);
+	uint8_t id = pkt16[1];
+	if (id >= MDM_SNAP_MAX) return false;
+	/* 16-byte memcpy is short enough that we accept a transient race
+	 * with publish_frame draining the slot — the next snapshot pass
+	 * will pick up a coherent value. Putting a mutex around this would
+	 * block the ESB receive path. */
+	memcpy(snap_pkt[id], pkt16, MDM_PKT_BYTES);
+	atomic_or(&snap_valid, (atomic_val_t)(1u << id));
 	return true;
 }
 
@@ -619,25 +634,37 @@ static mdm_state_t step_mqtt_conn(void)
 	return MDM_FAULT;
 }
 
-/* Drain aggregation ring and publish via QMTPUB binary mode.
+/* Drain the snapshot and publish via QMTPUB binary mode.
  *
  * Critical-path timing — this is called from step_ready ~30Hz. Every ms
  * here delays the next publish, so all the waits are intentionally short
  * and any failure just drops the current frame and lets the next one go. */
 static void publish_frame(void)
 {
-	int w = atomic_get(&agg_w);
-	int r = atomic_get(&agg_r);
-	if (w == r) return;
-	int count = (w - r + MDM_PKT_RING) % MDM_PKT_RING;
-	int payload_len = count * MDM_PKT_BYTES;
+	/* Atomically grab and clear the valid bitmap. Anything that arrives
+	 * after this point lands in the next frame. */
+	uint32_t valid = (uint32_t)atomic_set(&snap_valid, 0);
+	if (valid == 0) return;
+
+	/* Pack the valid slots back-to-back into a local buffer. n is
+	 * popcount(valid) up to MDM_SNAP_MAX. */
+	uint8_t out[MDM_SNAP_MAX * MDM_PKT_BYTES];
+	int n = 0;
+	for (int i = 0; i < MDM_SNAP_MAX; i++) {
+		if (valid & (1u << i)) {
+			memcpy(out + n * MDM_PKT_BYTES,
+			       snap_pkt[i], MDM_PKT_BYTES);
+			n++;
+		}
+	}
+	int payload_len = n * MDM_PKT_BYTES;
 
 	const char *topic = cfg.topic[0] ? cfg.topic : "rideform/0/frame";
 	char hdr[160];
-	int n = snprintf(hdr, sizeof(hdr),
+	int hl = snprintf(hdr, sizeof(hdr),
 		"AT+QMTPUB=0,0,0,0,\"%s\",%d\r", topic, payload_len);
-	if (n <= 0) return;
-	at_send_raw((const uint8_t *)hdr, n);
+	if (hl <= 0) return;
+	at_send_raw((const uint8_t *)hdr, hl);
 
 	/* Diagnostic counters — rate-limited to one log per second so they
 	 * don't drown the console at 30 Hz. */
@@ -660,26 +687,22 @@ static void publish_frame(void)
 			LOG_INF("modem: pub-miss rsp: %s", line);
 			drained++;
 		}
-		atomic_set(&agg_r, w);
 		goto maybe_log;
 	}
 
-	int idx = r;
-	for (int i = 0; i < count; i++) {
-		at_send_raw(agg_buf[idx], MDM_PKT_BYTES);
-		idx = (idx + 1) % MDM_PKT_RING;
-	}
-	atomic_set(&agg_r, w);
+	/* Single contiguous send — the TX serialisation semaphore in
+	 * at_send_raw means the whole block clears before we move on. */
+	at_send_raw(out, payload_len);
 
 	/* Short ack wait; if PUBACK doesn't show, the next publish will
 	 * still proceed (QoS 0 — we don't retry per-message anyway). */
 	char ack[MDM_LINE_MAX];
 	if (at_wait_prefix("+QMTPUB:", ack, sizeof(ack), 500) == 0) {
 		s_pub_ok++;
-		s_pkts_sent += count;
+		s_pkts_sent += n;
 	} else {
 		s_pub_ack_miss++;
-		s_pkts_sent += count;
+		s_pkts_sent += n;
 	}
 
 maybe_log:
