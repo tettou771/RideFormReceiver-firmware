@@ -390,7 +390,7 @@ static void console_thread(void)
 			/* RFT: BG770A modem control (wio_bg770a board only — stubs
 			 * elsewhere). Subcommands mirror QMTOPEN/QMTCONN params. */
 			if (argc < 2) {
-				printk("Usage: modem status|start|stop|at|apn|broker|client|topic|user|pass ...\n");
+				printk("Usage: modem status|start|stop|at|apn|broker|client|topic|user|pass|pace|ptmo ...\n");
 				continue;
 			}
 			strtolower(argv[1]);
@@ -431,6 +431,12 @@ static void console_thread(void)
 			} else if (strcmp(argv[1], "pass") == 0) {
 				modem_console_set_pass(argc >= 3 ? argv[2] : "");
 				printk("pass set\n");
+			} else if (strcmp(argv[1], "pace") == 0) {
+				if (argc >= 3) modem_set_pace((int)parse_i32(argv[2], 10));
+				printk("pace = %d ms\n", modem_get_pace());
+			} else if (strcmp(argv[1], "ptmo") == 0) {
+				if (argc >= 3) modem_set_ptmo((int)parse_i32(argv[2], 10));
+				printk("ptmo = %d ms\n", modem_get_ptmo());
 			} else {
 				printk("Unknown modem subcommand\n");
 			}

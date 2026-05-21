@@ -55,4 +55,12 @@ void modem_console_set_topic(const char *s);
 void modem_console_set_user(const char *s); /* "" clears */
 void modem_console_set_pass(const char *s);
 
+/* Live publish-tuning knobs (RAM only) for ceiling-probing experiments.
+ *   pace: min ms between publish attempts (lower = push harder).
+ *   ptmo: ms to wait for the QMTPUB ">" prompt before declaring a miss. */
+void modem_set_pace(int ms);
+void modem_set_ptmo(int ms);
+int  modem_get_pace(void);
+int  modem_get_ptmo(void);
+
 #endif /* RFT_MODEM_H */

@@ -53,6 +53,10 @@ void modem_console_set_client(const char *s) { (void)s; }
 void modem_console_set_topic(const char *s) { (void)s; }
 void modem_console_set_user(const char *s) { (void)s; }
 void modem_console_set_pass(const char *s) { (void)s; }
+void modem_set_pace(int ms) { (void)ms; }
+void modem_set_ptmo(int ms) { (void)ms; }
+int  modem_get_pace(void) { return 0; }
+int  modem_get_ptmo(void) { return 0; }
 
 #else /* MDM_AVAILABLE */
 
@@ -351,50 +355,56 @@ static mdm_state_t step_off(void)
 	return MDM_BOOT_PWR;
 }
 
-/* BG770A's PWRKEY is a toggle button: pulse while OFF turns it ON,
- * pulse while ON commands a shutdown. So we have to pulse it AT MOST
- * once per nRF52 boot — subsequent FAULT->BOOT_PWR retries (e.g. AT
- * timeout while the module is still finishing its own boot) must NOT
- * pulse again or we'd shut the modem down.
- *
- * Reset only happens via SoC reboot (which power-cycles this flag),
- * so once true it stays true for the life of this firmware run. */
-static bool pwrkey_pulsed = false;
-
-/* Tracks consecutive entries into FAULT without an intervening success.
- * If we stack up too many we suspect the BG770A is actually off (despite
- * our latch) — could happen if a previous run's PWRKEY pulse landed while
- * it was on and shut it down, leaving us stranded forever. Clear the
- * latch so the next BOOT_PWR re-pulses, giving us a way out. */
 static int consecutive_faults = 0;
 
+/* Send AT every second for up to timeout_ms, return true on first "OK".
+ * Used to detect whether the BG770A is alive *without* touching PWRKEY. */
+static bool at_probe_alive(int timeout_ms)
+{
+	int64_t deadline = k_uptime_get() + timeout_ms;
+	do {
+		at_send_line("AT");
+		if (at_wait_prefix("OK", NULL, 0, 1000) == 0) return true;
+	} while (k_uptime_get() < deadline);
+	return false;
+}
+
+/* BG770A's PWRKEY is a toggle (pulse-while-OFF powers on, pulse-while-ON
+ * shuts down) and this board does not wire the module's STATUS line back
+ * to the nRF52, so we cannot read the power state directly. Blindly
+ * pulsing on every start used to shut an already-on module down, costing
+ * ~7 min of FAULT recovery to climb back out.
+ *
+ * Robust approach: probe AT first. If the module answers — already on, or
+ * still auto-booting after VBAT — skip the pulse entirely. Pulse only when
+ * the module is genuinely silent. This is idempotent across FAULT retries
+ * too: a transient downstream fault re-enters here, re-probes (fast when
+ * the module is up), and never toggles a live module off. */
 static mdm_state_t step_boot_pwr(void)
 {
-	if (!pwrkey_pulsed) {
-		LOG_INF("modem: pulsing PWRKEY (first start)");
-		gpio_pin_set_dt(&mdm_pwr, 1);
-		k_msleep(700);
-		gpio_pin_set_dt(&mdm_pwr, 0);
-		pwrkey_pulsed = true;
-		/* Quectel datasheet: ~13s from PWRKEY release to URC "RDY" on
-		 * a cold boot. Sleep the worst case so AT_PROBE sees a ready
-		 * module, then drain whatever URC sits in the line buffer. */
-		k_msleep(13000);
-		(void)at_wait_prefix("RDY", NULL, 0, 500);
-	} else {
-		LOG_INF("modem: PWRKEY already pulsed this run, skipping");
+	/* 16s window covers the ~13s Quectel cold-boot-to-RDY, so an
+	 * auto-powered module is caught here rather than mistaken for off. */
+	if (at_probe_alive(16000)) {
+		LOG_INF("modem: AT alive without pulse — module already on");
+		consecutive_faults = 0;
+		return MDM_AT_CONFIG;
 	}
+
+	LOG_INF("modem: no AT response — pulsing PWRKEY");
+	gpio_pin_set_dt(&mdm_pwr, 1);
+	k_msleep(700);
+	gpio_pin_set_dt(&mdm_pwr, 0);
+	/* Quectel datasheet: ~13s from PWRKEY release to URC "RDY". */
+	k_msleep(13000);
+	(void)at_wait_prefix("RDY", NULL, 0, 500);
 	return MDM_AT_PROBE;
 }
 
 static mdm_state_t step_at_probe(void)
 {
-	for (int i = 0; i < 5; i++) {
-		at_send_line("AT");
-		if (at_wait_prefix("OK", NULL, 0, 1000) == 0) {
-			consecutive_faults = 0;  /* AT round-trip ok, healthy */
-			return MDM_AT_CONFIG;
-		}
+	if (at_probe_alive(5000)) {
+		consecutive_faults = 0;  /* AT round-trip ok, healthy */
+		return MDM_AT_CONFIG;
 	}
 	LOG_WRN("modem: AT probe timed out");
 	return MDM_FAULT;
@@ -552,6 +562,32 @@ static mdm_state_t step_pdp_act(void)
 	return MDM_FAULT;
 }
 
+/* MQTT-layer failure streak. Separate from consecutive_faults (which the
+ * AT probe in BOOT_PWR resets whenever the module answers AT) because a
+ * wedged MQTT stack still passes AT — so we'd loop FAULT->BOOT_PWR->
+ * MQTT_OPEN->fail forever. This counter survives the AT-probe reset. */
+static int mqtt_fail_streak = 0;
+#define MDM_MQTT_FAIL_HARD_RESET 4
+
+/* Escalating MQTT failure handler. First few failures just FAULT (soft
+ * retry: backoff -> re-probe -> QMTCLOSE/QMTOPEN). Once the streak shows
+ * the module's MQTT/TCP stack is wedged — which a soft reconnect can't
+ * clear, whether from publish flooding or a stalled uplink under poor
+ * signal — escalate to AT+CFUN=1,1, a full radio reboot that resets the
+ * PDP context and socket state. */
+static mdm_state_t mqtt_fail(void)
+{
+	if (++mqtt_fail_streak >= MDM_MQTT_FAIL_HARD_RESET) {
+		LOG_WRN("modem: %d MQTT failures — AT+CFUN=1,1 modem reset",
+		        mqtt_fail_streak);
+		mqtt_fail_streak = 0;
+		at_send_line("AT+CFUN=1,1");
+		k_msleep(2000);   /* module starts rebooting (~13s to RDY) */
+		return MDM_BOOT_PWR;  /* re-probe AT, then full chain re-init */
+	}
+	return MDM_FAULT;
+}
+
 static mdm_state_t step_mqtt_open(void)
 {
 	if (!cfg.host[0]) {
@@ -562,6 +598,15 @@ static mdm_state_t step_mqtt_open(void)
 
 	char buf[160];
 	char line[MDM_LINE_MAX];
+
+	/* Tear down any stale session first. On a reconnect (publish-failure
+	 * recovery) socket 0 may still be half-open on the module; QMTOPEN
+	 * would then return "already in use". Disconnect + close are no-ops
+	 * on a fresh boot, so we ignore their results either way. */
+	at_send_line("AT+QMTDISC=0");
+	(void)at_wait_prefix("+QMTDISC:", line, sizeof(line), 2000);
+	at_send_line("AT+QMTCLOSE=0");
+	(void)at_wait_prefix("+QMTCLOSE:", line, sizeof(line), 2000);
 
 	/* First confirm the PDP context is really up by re-asking — if QIACT
 	 * stuck without an IP, everything below silently fails. */
@@ -609,7 +654,7 @@ static mdm_state_t step_mqtt_open(void)
 		}
 	}
 	LOG_WRN("modem: QMTOPEN failed (host=%s port=%u)", cfg.host, cfg.port);
-	return MDM_FAULT;
+	return mqtt_fail();
 }
 
 static mdm_state_t step_mqtt_conn(void)
@@ -628,10 +673,11 @@ static mdm_state_t step_mqtt_conn(void)
 	at_send_line(buf);
 	if (at_wait_prefix("+QMTCONN: 0,0,0", NULL, 0, 10000) == 0) {
 		LOG_INF("modem: connected to %s:%u", cfg.host, cfg.port);
+		mqtt_fail_streak = 0;   /* healthy session — clear escalation */
 		return MDM_READY;
 	}
 	LOG_WRN("modem: QMTCONN failed");
-	return MDM_FAULT;
+	return mqtt_fail();
 }
 
 /* Drain the snapshot and publish via QMTPUB binary mode.
@@ -639,12 +685,32 @@ static mdm_state_t step_mqtt_conn(void)
  * Critical-path timing — this is called from step_ready ~30Hz. Every ms
  * here delays the next publish, so all the waits are intentionally short
  * and any failure just drops the current frame and lets the next one go. */
-static void publish_frame(void)
+/* Tunable publish knobs (RAM only — for live ceiling-probing via console;
+ * power cycle reverts to these defaults).
+ *   pace: min ms between publish attempts. Lower = push harder.
+ *   ptmo: how long to wait for the ">" prompt before declaring a miss. */
+/* Defaults from live ceiling-probing on hardware (2026-05-21): the QMTPUB
+ * ">" prompt lands in ~12ms, so ptmo 15 leaves a safe margin; pace 10
+ * gives a steady ~40Hz (2-3x the old 17Hz). Pushing pace below ~5 risks
+ * backlogging the BG770A's MQTT stack into a wedged state that a soft
+ * reconnect can't clear (see step_ready recovery + escalation notes). */
+static int mdm_pub_pace_ms   = 10;
+static int mdm_prompt_tmo_ms = 15;
+
+void modem_set_pace(int ms)  { mdm_pub_pace_ms   = (ms < 0)  ? 0  : ms; }
+void modem_set_ptmo(int ms)  { mdm_prompt_tmo_ms = (ms < 10) ? 10 : ms; }
+int  modem_get_pace(void)    { return mdm_pub_pace_ms; }
+int  modem_get_ptmo(void)    { return mdm_prompt_tmo_ms; }
+
+/* Returns: 1 = published, 0 = nothing to send, -1 = publish failed
+ * (no ">" prompt — modem backlogged or MQTT session gone). step_ready
+ * uses the -1 count to decide when to force a reconnect. */
+static int publish_frame(void)
 {
 	/* Atomically grab and clear the valid bitmap. Anything that arrives
 	 * after this point lands in the next frame. */
 	uint32_t valid = (uint32_t)atomic_set(&snap_valid, 0);
-	if (valid == 0) return;
+	if (valid == 0) return 0;
 
 	/* Pack the valid slots back-to-back into a local buffer. n is
 	 * popcount(valid) up to MDM_SNAP_MAX. */
@@ -663,24 +729,27 @@ static void publish_frame(void)
 	char hdr[160];
 	int hl = snprintf(hdr, sizeof(hdr),
 		"AT+QMTPUB=0,0,0,0,\"%s\",%d\r", topic, payload_len);
-	if (hl <= 0) return;
+	if (hl <= 0) return 0;
 	at_send_raw((const uint8_t *)hdr, hl);
 
 	/* Diagnostic counters — rate-limited to one log per second so they
 	 * don't drown the console at 30 Hz. */
 	static int64_t s_last_log_ms = 0;
-	static int s_pub_ok = 0, s_pub_prompt_miss = 0, s_pub_ack_miss = 0;
+	static int s_pub_ok = 0, s_pub_prompt_miss = 0;
 	static int s_pkts_sent = 0;
+	int result = 1;
 
 	/* Wait for the ">" prompt — emitted by BG770A right before it expects
 	 * payload bytes. rx_line_thread emits ">" as its own line so we can
-	 * just wait_prefix on it. */
-	if (at_wait_prefix(">", NULL, 0, 500) != 0) {
+	 * just wait_prefix on it. Timeout is short (150ms): when the modem is
+	 * keeping up the prompt lands in a few ms, and a miss shouldn't stall
+	 * the whole loop — a long timeout here is what makes the publish rate
+	 * jitter wildly under backlog. */
+	if (at_wait_prefix(">", NULL, 0, mdm_prompt_tmo_ms) != 0) {
 		s_pub_prompt_miss++;
-		/* Drain whatever did arrive in the prompt window — usually
-		 * "ERROR" when the MQTT session is gone, "+CME ERROR: <n>"
-		 * for command-level failures, etc. Tells us *why* prompt
-		 * didn't show. */
+		result = -1;
+		/* Drain whatever did arrive — "ERROR"/"+CME ERROR" means the
+		 * MQTT session is gone (vs. plain backlog where nothing comes). */
 		char line[MDM_LINE_MAX];
 		int drained = 0;
 		while (k_msgq_get(&line_msgq, line, K_NO_WAIT) == 0 && drained < 5) {
@@ -694,36 +763,55 @@ static void publish_frame(void)
 	 * at_send_raw means the whole block clears before we move on. */
 	at_send_raw(out, payload_len);
 
-	/* Short ack wait; if PUBACK doesn't show, the next publish will
-	 * still proceed (QoS 0 — we don't retry per-message anyway). */
-	char ack[MDM_LINE_MAX];
-	if (at_wait_prefix("+QMTPUB:", ack, sizeof(ack), 500) == 0) {
-		s_pub_ok++;
-		s_pkts_sent += n;
-	} else {
-		s_pub_ack_miss++;
-		s_pkts_sent += n;
-	}
+	/* Optimization #1: do NOT block waiting for the "+QMTPUB:" URC.
+	 * It's QoS 0, so we never retry per-message — the ack carries no
+	 * actionable info and the wait was the dominant per-publish cost
+	 * (~500ms worst case, capping us near ~17Hz). The URC still arrives
+	 * asynchronously; the next publish's at_wait_prefix(">") drains it
+	 * (it discards non-matching lines). line_msgq depth (16) easily
+	 * absorbs the 1 stale ack between publishes.
+	 *
+	 * ack_miss is retired; s_pub_ok now counts "frames pushed". */
+	s_pub_ok++;
+	s_pkts_sent += n;
 
 maybe_log:
 	{
 		int64_t now = k_uptime_get();
 		if (now - s_last_log_ms > 1000) {
 			s_last_log_ms = now;
-			LOG_INF("modem: pub ok=%d prompt_miss=%d ack_miss=%d pkts=%d",
-			        s_pub_ok, s_pub_prompt_miss, s_pub_ack_miss, s_pkts_sent);
+			LOG_INF("modem: pub ok=%d prompt_miss=%d pkts=%d",
+			        s_pub_ok, s_pub_prompt_miss, s_pkts_sent);
 			s_pub_ok = 0;
 			s_pub_prompt_miss = 0;
-			s_pub_ack_miss = 0;
 			s_pkts_sent = 0;
 		}
 	}
+	return result;
 }
+
+/* Consecutive publish failures before we assume the MQTT session is dead
+ * (vs. transient backlog) and force a full reconnect. At ~30Hz with the
+ * default prompt timeout, ~20 misses ≈ a few seconds of nothing through. */
+#define MDM_PUB_FAIL_RECONNECT  20
 
 static mdm_state_t step_ready(void)
 {
-	publish_frame();
-	k_msleep(33); /* ~30 fps */
+	static int consecutive_pub_fail = 0;
+
+	int r = publish_frame();
+	if (r < 0) {
+		if (++consecutive_pub_fail >= MDM_PUB_FAIL_RECONNECT) {
+			LOG_WRN("modem: %d publish failures — reconnecting MQTT",
+			        consecutive_pub_fail);
+			consecutive_pub_fail = 0;
+			return MDM_MQTT_OPEN;  /* re-open TCP + MQTT from scratch */
+		}
+	} else if (r > 0) {
+		consecutive_pub_fail = 0;  /* a good publish clears the streak */
+	}
+
+	k_msleep(mdm_pub_pace_ms);
 	return MDM_READY;
 }
 
@@ -735,11 +823,10 @@ static mdm_state_t step_fault(void)
 	k_msleep(5000);
 	if (!start_requested) return MDM_OFF;
 
-	if (consecutive_faults >= 3) {
-		LOG_WRN("modem: 3+ faults in a row, re-enabling PWRKEY pulse");
-		pwrkey_pulsed = false;
-		consecutive_faults = 0;
-	}
+	/* Always route back through BOOT_PWR. It now probes AT before
+	 * pulsing, so retries are self-correcting: if the module is alive
+	 * it skips straight on; if it's truly off (e.g. an earlier stray
+	 * pulse shut it down) the probe fails and it gets pulsed back on. */
 	return MDM_BOOT_PWR;
 }
 
@@ -749,6 +836,14 @@ static void modem_thread(void)
 	gpio_pin_configure_dt(&mdm_pwr, GPIO_OUTPUT_INACTIVE);
 	gpio_pin_configure_dt(&mdm_rst, GPIO_OUTPUT_INACTIVE);
 	(void)uart_start_rx();
+
+	/* Autostart: bring the LTE link up on boot without waiting for a
+	 * `modem start` console command — the receiver runs headless in the
+	 * field (no laptop). Short settle delay lets ESB + USB CDC enumerate
+	 * first. `modem stop` still halts it (start_requested=false). */
+	k_msleep(2000);
+	start_requested = true;
+	LOG_INF("modem: autostart");
 
 	while (1) {
 		mdm_state_t cur = state;
