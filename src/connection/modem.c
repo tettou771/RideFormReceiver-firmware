@@ -402,7 +402,13 @@ static mdm_state_t step_boot_pwr(void)
 
 static mdm_state_t step_at_probe(void)
 {
-	if (at_probe_alive(5000)) {
+	/* 15s (was 5s): this runs right after either a PWRKEY pulse (step_boot_pwr
+	 * already waited 13s) or an AT+CFUN=1,1 reboot (step_at_config waited 15s),
+	 * but a BG770A can still need a few extra seconds to accept AT after RDY.
+	 * A too-short window dropped us into FAULT mid-boot, and the FAULT->BOOT_PWR
+	 * retry could then PWRKEY-toggle a module that was merely still booting —
+	 * the runaway loop behind "consecutive=10, won't recover". */
+	if (at_probe_alive(15000)) {
 		consecutive_faults = 0;  /* AT round-trip ok, healthy */
 		return MDM_AT_CONFIG;
 	}
@@ -418,8 +424,17 @@ static bool band_provisioned = false;
 
 static mdm_state_t step_at_config(void)
 {
+	/* Gate everything below on a confirmed AT round-trip. A desynced or
+	 * still-booting module silently times out every command — yet the old
+	 * code would charge ahead, run AT+CFUN=1,1 into the void, and latch
+	 * band_provisioned=true against a dead UART (so the one-shot provisioning
+	 * was wasted and never retried). Bounce back to AT_PROBE instead; only a
+	 * module that actually answered ATE0 proceeds. */
 	at_send_line("ATE0");
-	(void)at_wait_prefix("OK", NULL, 0, 500);
+	if (at_wait_prefix("OK", NULL, 0, 1000) != 0) {
+		LOG_WRN("modem: ATE0 got no OK — module not ready, re-probing");
+		return MDM_AT_PROBE;
+	}
 	at_send_line("AT+CMEE=1");
 	(void)at_wait_prefix("OK", NULL, 0, 500);
 
@@ -689,13 +704,20 @@ static mdm_state_t step_mqtt_conn(void)
  * power cycle reverts to these defaults).
  *   pace: min ms between publish attempts. Lower = push harder.
  *   ptmo: how long to wait for the ">" prompt before declaring a miss. */
-/* Defaults from live ceiling-probing on hardware (2026-05-21): the QMTPUB
- * ">" prompt lands in ~12ms, so ptmo 15 leaves a safe margin; pace 10
- * gives a steady ~40Hz (2-3x the old 17Hz). Pushing pace below ~5 risks
- * backlogging the BG770A's MQTT stack into a wedged state that a soft
- * reconnect can't clear (see step_ready recovery + escalation notes). */
-static int mdm_pub_pace_ms   = 10;
-static int mdm_prompt_tmo_ms = 15;
+/* Snapshot publish (latest-per-tracker, small ~160B payloads) at pace 10ms
+ * gives a steady ~20-40Hz. ptmo 200 is generous on purpose: a too-short
+ * timeout that fires while the modem is mid-prompt skips the payload send
+ * but leaves the modem waiting for it, desyncing the byte stream (the next
+ * command gets read as binary payload -> corrupt publishes). A real miss
+ * now only means a dead session, which the recovery path handles.
+ * (Lossless batching was tried but large payloads corrupt on the BG770A;
+ * reverted to snapshot — see git history around 2026-05-21.) */
+/* pace 33ms ≈ 30Hz (was 10ms ≈ up to 100Hz). At pace 10 the modem's UART
+ * traffic spiked ESB busy/s to ~36 and starved tracker reception even with a
+ * single tracker; 30Hz is plenty for riding-form analysis and leaves the
+ * radio far more headroom. Still live-tunable via `modem pace <ms>`. */
+static int mdm_pub_pace_ms   = 33;
+static int mdm_prompt_tmo_ms = 200;
 
 void modem_set_pace(int ms)  { mdm_pub_pace_ms   = (ms < 0)  ? 0  : ms; }
 void modem_set_ptmo(int ms)  { mdm_prompt_tmo_ms = (ms < 10) ? 10 : ms; }
@@ -737,6 +759,7 @@ static int publish_frame(void)
 	static int64_t s_last_log_ms = 0;
 	static int s_pub_ok = 0, s_pub_prompt_miss = 0;
 	static int s_pkts_sent = 0;
+	static int s_consec_miss = 0;
 	int result = 1;
 
 	/* Wait for the ">" prompt — emitted by BG770A right before it expects
@@ -747,16 +770,32 @@ static int publish_frame(void)
 	 * jitter wildly under backlog. */
 	if (at_wait_prefix(">", NULL, 0, mdm_prompt_tmo_ms) != 0) {
 		s_pub_prompt_miss++;
-		result = -1;
-		/* Drain whatever did arrive — "ERROR"/"+CME ERROR" means the
-		 * MQTT session is gone (vs. plain backlog where nothing comes). */
+		/* Drain whatever did arrive. An explicit "ERROR"/"+CME ERROR" means
+		 * QMTPUB was rejected outright — no data-input mode opened, so the
+		 * MQTT session is gone. */
 		char line[MDM_LINE_MAX];
-		int drained = 0;
-		while (k_msgq_get(&line_msgq, line, K_NO_WAIT) == 0 && drained < 5) {
+		bool saw_error = false;
+		while (k_msgq_get(&line_msgq, line, K_NO_WAIT) == 0) {
 			LOG_INF("modem: pub-miss rsp: %s", line);
-			drained++;
+			if (strstr(line, "ERROR")) saw_error = true;
 		}
-		goto maybe_log;
+		if (saw_error || ++s_consec_miss >= 30) {
+			/* Real error, or the prompt has gone missing for ~30 frames
+			 * straight (link wedged). Force a reconnect — the QMTCLOSE/
+			 * QMTOPEN there also clears any half-open data-input mode. */
+			result = -1;
+			s_consec_miss = 0;
+			goto maybe_log;
+		}
+		/* Otherwise the prompt was merely late: under ESB load the modem
+		 * thread gets starved and reads "> " a beat after it arrives. The
+		 * module HAS entered data mode and is counting down payload_len
+		 * bytes, so we MUST still send the payload — skipping it (the old
+		 * behaviour) left the module wedged waiting for bytes that never
+		 * came, desyncing every subsequent publish until a reconnect.
+		 * Fall through and send, just late. */
+	} else {
+		s_consec_miss = 0;
 	}
 
 	/* Single contiguous send — the TX serialisation semaphore in
