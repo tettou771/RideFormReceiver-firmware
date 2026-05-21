@@ -49,7 +49,11 @@ uint32_t* dbl_reset_mem = ((uint32_t*) DFU_DBL_RESET_MEM);
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
-K_THREAD_DEFINE(console_thread_id, 1024, console_thread, NULL, NULL, NULL, 6, 0, 0);
+// RFT: 2048 (was 1024) — `modem at` nests console_thread -> modem_console_at
+// (line[256]) -> at_send_line (buf[256]) plus a 160B rejoin buffer, which
+// overran the 1024B stack and tripped the MPU guard (HW_STACK_PROTECTION),
+// rebooting the board on every raw-AT command.
+K_THREAD_DEFINE(console_thread_id, 2048, console_thread, NULL, NULL, NULL, 6, 0, 0);
 
 #define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
