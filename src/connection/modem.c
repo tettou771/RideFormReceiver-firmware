@@ -155,6 +155,50 @@ static int uart_start_rx(void)
  * concern. Without this, the prompt sits in the ring buffer until the
  * next '\n' arrives — which it doesn't, since the prompt is "> " with
  * no newline — and the sender stalls every publish. */
+/* ---- MQTT control + liveness (subscribe path) ----------------------- */
+/* We subscribe to a control topic and use it for two things:
+ *   - start/stop: a "start"/"stop" message enables/disables data publishing
+ *     (the link stays connected so we can be re-started remotely).
+ *   - ping/pong liveness: we publish "ping:<n>" to the same topic and expect
+ *     it looped back by the broker. A missing echo means the full path
+ *     (not just TCP) is dead — more reliable and faster than the modem's
+ *     keepalive, and lighter to tune. */
+static const char       *mdm_ctrl_topic     = "rideform/0/ctrl";
+static volatile bool     mdm_publish_enabled = true;
+static volatile bool     mdm_confirm_pending = false; /* send started/stopped */
+static volatile int64_t  mdm_last_pong_ms    = 0;   /* last ping echo seen */
+
+/* Parse an inline +QMTRECV URC and act on it. With recv/mode inline the URC is
+ *   +QMTRECV: <idx>,<mid>,"<topic>","<payload>"
+ * so the payload is the last double-quoted field. Run from rx_line_thread so
+ * control/ping messages are handled regardless of what the state machine is
+ * currently waiting on (at_wait_prefix would otherwise discard them). */
+static void handle_qmtrecv(const char *line)
+{
+	const char *close = strrchr(line, '"');
+	if (!close) return;
+	const char *open = close - 1;
+	while (open > line && *open != '"') open--;
+	if (*open != '"' || open >= close) return;
+	char payload[48];
+	size_t n = (size_t)(close - open - 1);
+	if (n >= sizeof(payload)) n = sizeof(payload) - 1;
+	memcpy(payload, open + 1, n);
+	payload[n] = 0;
+
+	if (strncmp(payload, "ping:", 5) == 0) {
+		mdm_last_pong_ms = k_uptime_get();   /* round trip alive */
+	} else if (strcmp(payload, "start") == 0) {
+		mdm_publish_enabled = true;
+		mdm_confirm_pending = true;
+		LOG_INF("modem: MQTT cmd -> start");
+	} else if (strcmp(payload, "stop") == 0) {
+		mdm_publish_enabled = false;
+		mdm_confirm_pending = true;
+		LOG_INF("modem: MQTT cmd -> stop");
+	}
+}
+
 static void rx_line_thread(void)
 {
 	static char buf[MDM_LINE_MAX];
@@ -167,9 +211,15 @@ static void rx_line_thread(void)
 			if (b == '\n') {
 				if (pos > 0) {
 					buf[pos] = 0;
-					char tmp[MDM_LINE_MAX];
-					memcpy(tmp, buf, pos + 1);
-					(void)k_msgq_put(&line_msgq, tmp, K_NO_WAIT);
+					if (strncmp(buf, "+QMTRECV", 8) == 0) {
+						/* Control/ping URC — handle here, don't
+						 * enqueue (the state machine would discard it). */
+						handle_qmtrecv(buf);
+					} else {
+						char tmp[MDM_LINE_MAX];
+						memcpy(tmp, buf, pos + 1);
+						(void)k_msgq_put(&line_msgq, tmp, K_NO_WAIT);
+					}
 					pos = 0;
 				}
 				continue;
@@ -593,19 +643,29 @@ static mdm_state_t step_pdp_act(void)
  * wedged MQTT stack still passes AT — so we'd loop FAULT->BOOT_PWR->
  * MQTT_OPEN->fail forever. This counter survives the AT-probe reset. */
 static int mqtt_fail_streak = 0;
-#define MDM_MQTT_FAIL_HARD_RESET 4
+#define MDM_MQTT_FAIL_HARD_RESET      4   /* radio/PDP looks dead — reboot soon */
+#define MDM_MQTT_FAIL_HARD_RESET_PDP 30   /* PDP alive (broker likely down) — rarely */
 
-/* Escalating MQTT failure handler. First few failures just FAULT (soft
- * retry: backoff -> re-probe -> QMTCLOSE/QMTOPEN). Once the streak shows
- * the module's MQTT/TCP stack is wedged — which a soft reconnect can't
- * clear, whether from publish flooding or a stalled uplink under poor
- * signal — escalate to AT+CFUN=1,1, a full radio reboot that resets the
- * PDP context and socket state. */
+/* True when step_mqtt_open last saw an active PDP context (AT+QIACT?). If the
+ * data link is up but MQTT won't connect, the broker is probably down/メンテ —
+ * rebooting the radio is pointless and just burns data + battery on LTE
+ * re-attaches. So only escalate to a full CFUN reset quickly when the radio
+ * itself looks dead; when the PDP is healthy, keep soft-retrying QMTOPEN (which
+ * succeeds the moment the broker returns) and reset the radio only as a very
+ * last resort. */
+static volatile bool mdm_pdp_alive = false;
+
+/* Escalating MQTT failure handler. Soft retry (FAULT -> backoff -> re-probe ->
+ * QMTCLOSE/QMTOPEN) for most failures; AT+CFUN=1,1 full radio reboot only when
+ * the streak is long enough to suspect a wedged stack — and far more patiently
+ * when the PDP context is up (broker-down case). */
 static mdm_state_t mqtt_fail(void)
 {
-	if (++mqtt_fail_streak >= MDM_MQTT_FAIL_HARD_RESET) {
-		LOG_WRN("modem: %d MQTT failures — AT+CFUN=1,1 modem reset",
-		        mqtt_fail_streak);
+	int threshold = mdm_pdp_alive ? MDM_MQTT_FAIL_HARD_RESET_PDP
+	                              : MDM_MQTT_FAIL_HARD_RESET;
+	if (++mqtt_fail_streak >= threshold) {
+		LOG_WRN("modem: %d MQTT failures (pdp_alive=%d) — AT+CFUN=1,1 modem reset",
+		        mqtt_fail_streak, (int)mdm_pdp_alive);
 		mqtt_fail_streak = 0;
 		at_send_line("AT+CFUN=1,1");
 		k_msleep(2000);   /* module starts rebooting (~13s to RDY) */
@@ -639,8 +699,10 @@ static mdm_state_t step_mqtt_open(void)
 	at_send_line("AT+QIACT?");
 	if (at_wait_prefix("+QIACT:", line, sizeof(line), 3000) == 0) {
 		LOG_INF("modem: %s", line);
+		mdm_pdp_alive = true;   /* data link up — a QMTOPEN fail = broker, not radio */
 	} else {
 		LOG_WRN("modem: no PDP context active");
+		mdm_pdp_alive = false;
 	}
 
 	/* Try a ping to the broker host — this exercises DNS resolution AND
@@ -686,6 +748,15 @@ static mdm_state_t step_mqtt_open(void)
 static mdm_state_t step_mqtt_conn(void)
 {
 	char buf[160];
+	/* Keepalive as a backstop (the app-level ping/pong below is the primary,
+	 * faster liveness check). Must be set before QMTCONN. */
+	at_send_line("AT+QMTCFG=\"keepalive\",0,20");
+	(void)at_wait_prefix("OK", NULL, 0, 1000);
+	/* Inline receive: the payload arrives directly in the +QMTRECV URC, so
+	 * rx_line_thread can act on control/ping messages with no read step. */
+	at_send_line("AT+QMTCFG=\"recv/mode\",0,0,1");
+	(void)at_wait_prefix("OK", NULL, 0, 1000);
+
 	if (cfg.user[0]) {
 		snprintf(buf, sizeof(buf),
 			"AT+QMTCONN=0,\"%s\",\"%s\",\"%s\"",
@@ -700,6 +771,12 @@ static mdm_state_t step_mqtt_conn(void)
 	if (at_wait_prefix("+QMTCONN: 0,0,0", NULL, 0, 10000) == 0) {
 		LOG_INF("modem: connected to %s:%u", cfg.host, cfg.port);
 		mqtt_fail_streak = 0;   /* healthy session — clear escalation */
+		/* Subscribe to the control topic: start/stop commands + the loopback
+		 * of our own liveness pings. */
+		snprintf(buf, sizeof(buf), "AT+QMTSUB=0,1,\"%s\",0", mdm_ctrl_topic);
+		at_send_line(buf);
+		(void)at_wait_prefix("+QMTSUB:", NULL, 0, 5000);
+		mdm_last_pong_ms = k_uptime_get();  /* seed so liveness doesn't instant-trip */
 		return MDM_READY;
 	}
 	LOG_WRN("modem: QMTCONN failed");
@@ -859,20 +936,71 @@ maybe_log:
  * default prompt timeout, ~20 misses ≈ a few seconds of nothing through. */
 #define MDM_PUB_FAIL_RECONNECT  20
 
+/* Liveness ping/pong: publish a token to the control topic we subscribe to and
+ * expect the broker to loop it back (handle_qmtrecv refreshes mdm_last_pong_ms).
+ * A QMTPUB can "succeed" locally into a silently dead TCP session (no ERROR, so
+ * the publish-failure streak never trips) — this round-trip check sees that
+ * because the echo stops arriving. Faster and lighter than the modem keepalive. */
+#define MDM_PING_PERIOD_MS       5000   /* while streaming */
+#define MDM_PING_PERIOD_IDLE_MS  30000  /* while stopped — just keep the link warm */
+
+/* Publish a short text payload (control / ping). Runs only from the modem
+ * thread, so it serialises with the data publishes. */
+static void mqtt_publish_text(const char *topic, const char *str)
+{
+	int sl = (int)strlen(str);
+	char hdr[96];
+	int hl = snprintf(hdr, sizeof(hdr),
+		"AT+QMTPUB=0,0,0,0,\"%s\",%d\r", topic, sl);
+	at_send_raw((const uint8_t *)hdr, hl);
+	if (at_wait_prefix(">", NULL, 0, 500) == 0)
+		at_send_raw((const uint8_t *)str, sl);
+}
+
 static mdm_state_t step_ready(void)
 {
 	static int consecutive_pub_fail = 0;
+	static int64_t last_ping_ms = 0;
 
-	int r = publish_frame();
-	if (r < 0) {
-		if (++consecutive_pub_fail >= MDM_PUB_FAIL_RECONNECT) {
-			LOG_WRN("modem: %d publish failures — reconnecting MQTT",
-			        consecutive_pub_fail);
-			consecutive_pub_fail = 0;
-			return MDM_MQTT_OPEN;  /* re-open TCP + MQTT from scratch */
+	/* Acknowledge a start/stop command back to the Deck. Done here (modem
+	 * thread) rather than in handle_qmtrecv (rx ISR) so all TX is serialised. */
+	if (mdm_confirm_pending) {
+		mdm_confirm_pending = false;
+		mqtt_publish_text(mdm_ctrl_topic,
+		                  mdm_publish_enabled ? "started" : "stopped");
+	}
+
+	if (mdm_publish_enabled) {
+		int r = publish_frame();
+		if (r < 0) {
+			if (++consecutive_pub_fail >= MDM_PUB_FAIL_RECONNECT) {
+				LOG_WRN("modem: %d publish failures — reconnecting MQTT",
+				        consecutive_pub_fail);
+				consecutive_pub_fail = 0;
+				return MDM_MQTT_OPEN;  /* re-open TCP + MQTT from scratch */
+			}
+		} else if (r > 0) {
+			consecutive_pub_fail = 0;  /* a good publish clears the streak */
 		}
-	} else if (r > 0) {
-		consecutive_pub_fail = 0;  /* a good publish clears the streak */
+	}
+
+	/* Ping/pong liveness. Slower cadence while stopped (the link only needs to
+	 * stay warm). The dead-link threshold scales with the period so a longer
+	 * idle cadence doesn't trip a false reconnect between pings. */
+	int64_t now = k_uptime_get();
+	int ping_period = mdm_publish_enabled ? MDM_PING_PERIOD_MS
+	                                      : MDM_PING_PERIOD_IDLE_MS;
+	if (now - last_ping_ms > ping_period) {
+		last_ping_ms = now;
+		char ping[24];
+		static uint32_t seq = 0;
+		snprintf(ping, sizeof(ping), "ping:%u", ++seq);
+		mqtt_publish_text(mdm_ctrl_topic, ping);
+		if (now - mdm_last_pong_ms > (int64_t)ping_period * 3) {
+			LOG_WRN("modem: no MQTT ping echo (>%dms) — reconnecting",
+			        ping_period * 3);
+			return MDM_MQTT_OPEN;
+		}
 	}
 
 	k_msleep(mdm_pub_pace_ms);
@@ -887,10 +1015,15 @@ static mdm_state_t step_fault(void)
 	k_msleep(5000);
 	if (!start_requested) return MDM_OFF;
 
-	/* Always route back through BOOT_PWR. It now probes AT before
-	 * pulsing, so retries are self-correcting: if the module is alive
-	 * it skips straight on; if it's truly off (e.g. an earlier stray
-	 * pulse shut it down) the probe fails and it gets pulsed back on. */
+	/* If the data link is still up (the broker-down case), skip the full
+	 * AT/registration re-walk and retry just the MQTT layer — lighter and
+	 * faster while we wait for the broker to come back. */
+	if (mdm_pdp_alive) return MDM_MQTT_OPEN;
+
+	/* Otherwise route back through BOOT_PWR. It probes AT before pulsing, so
+	 * retries are self-correcting: if the module is alive it skips straight
+	 * on; if it's truly off (e.g. an earlier stray pulse shut it down) the
+	 * probe fails and it gets pulsed back on. */
 	return MDM_BOOT_PWR;
 }
 
