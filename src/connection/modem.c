@@ -277,38 +277,49 @@ static void cfg_load(void)
 	if (cfg.port == 0) cfg.port = 1883;
 }
 
-/* ---- Tracker packet snapshot ---------------------------------------- */
-/* "Latest snapshot per tracker" rather than a FIFO of every ESB packet.
- * Each tracker overwrites its own slot at receive time; the publish
- * worker drains the whole snapshot at a fixed 30 Hz, serialising one
- * 16-byte slot per id with a valid bit set, and packs them back to back
- * into one MQTT message. Effects:
- *   - publish cadence becomes wall-clock (≈30 fps) instead of ESB-driven,
- *     so the receiving Deck's sample-rate math stays sane
- *   - same id never appears twice in one publish, halving bandwidth
- *     vs the old "every ESB packet through" path
- *   - trackers that didn't send during a window simply don't appear in
- *     that window — the Deck's isTimedOut(3s) handles the disappearance
+/* ---- Tracker packet ring (batched publish) -------------------------- */
+/* A single chronological SPSC ring of raw 16-byte ESB packets. The ESB
+ * event_handler (ISR context) is the only producer; the modem thread is the
+ * only consumer, so head/tail need no lock — aligned 16-bit accesses are
+ * atomic on Cortex-M and each side only advances its own index.
  *
- * MDM_SNAP_MAX caps the id range we track. 32 is plenty for the 10-
- * tracker rig; using a uint32_t valid bitmap lets us atomic_or in the
- * ESB receive callback without a lock. */
-#define MDM_PKT_BYTES   16
-#define MDM_SNAP_MAX    32
+ * Why a FIFO of every packet rather than the old "latest per id" snapshot:
+ * the LTE-M / BG770A AT path tops out at ~10 QMTPUB/s, so we publish slowly
+ * (~5 Hz) but pack every sample received in the interval into one message. At
+ * a 30 Hz per-tracker cap that's ~6 samples/tracker/publish — the Deck takes
+ * the last for live (and can replay the rest later), recovering ~30 Hz of
+ * temporal resolution over a link that can only carry ~5 messages/s.
+ * Chronological order is preserved, which is exactly what time-replay wants.
+ *
+ * MDM_TXRING_SZ must be a power of two (mask wrap). 256 packets = 4 KB,
+ * ~0.85 s of buffer at 300 pkt/s (10 trackers × 30 Hz). */
+/* 20 bytes forwarded per ESB packet: the 16B SlimeVR payload + the tracker's
+ * 4B CRC32 (rx_payload.data[16..19], the seq byte [20] is dropped). The
+ * receiver already verified this CRC over the air (esb.c), but the nRF->BG770A
+ * UART leg has no checksum, so we carry the CRC through to the Deck for an
+ * end-to-end integrity check that pinpoints UART/MQTT-path corruption. */
+#define MDM_PKT_BYTES    20
+#define MDM_TXRING_SZ    256
+#define MDM_TXRING_MASK  (MDM_TXRING_SZ - 1)
 
-static uint8_t   snap_pkt[MDM_SNAP_MAX][MDM_PKT_BYTES];
-static atomic_t  snap_valid = ATOMIC_INIT(0);
+static uint8_t           txring[MDM_TXRING_SZ][MDM_PKT_BYTES];
+static volatile uint16_t txr_head;    /* producer (ISR) advances */
+static volatile uint16_t txr_tail;    /* consumer (modem thread) advances */
+static volatile uint32_t txr_dropped; /* ring-full drops, diagnostics */
 
 bool modem_enqueue_tracker_packet(const uint8_t *pkt16)
 {
-	uint8_t id = pkt16[1];
-	if (id >= MDM_SNAP_MAX) return false;
-	/* 16-byte memcpy is short enough that we accept a transient race
-	 * with publish_frame draining the slot — the next snapshot pass
-	 * will pick up a coherent value. Putting a mutex around this would
-	 * block the ESB receive path. */
-	memcpy(snap_pkt[id], pkt16, MDM_PKT_BYTES);
-	atomic_or(&snap_valid, (atomic_val_t)(1u << id));
+	uint16_t head = txr_head;
+	uint16_t next = (head + 1) & MDM_TXRING_MASK;
+	if (next == txr_tail) {
+		/* Ring full — consumer stalled (modem wedged/reconnecting). Drop
+		 * the newest sample rather than break the SPSC invariant by
+		 * touching tail from the producer side. */
+		txr_dropped++;
+		return false;
+	}
+	memcpy(txring[head], pkt16, MDM_PKT_BYTES);
+	txr_head = next;   /* publish the slot only after it is fully written */
 	return true;
 }
 
@@ -710,13 +721,15 @@ static mdm_state_t step_mqtt_conn(void)
  * but leaves the modem waiting for it, desyncing the byte stream (the next
  * command gets read as binary payload -> corrupt publishes). A real miss
  * now only means a dead session, which the recovery path handles.
- * (Lossless batching was tried but large payloads corrupt on the BG770A;
- * reverted to snapshot — see git history around 2026-05-21.) */
-/* pace 33ms ≈ 30Hz (was 10ms ≈ up to 100Hz). At pace 10 the modem's UART
- * traffic spiked ESB busy/s to ~36 and starved tracker reception even with a
- * single tracker; 30Hz is plenty for riding-form analysis and leaves the
- * radio far more headroom. Still live-tunable via `modem pace <ms>`. */
-static int mdm_pub_pace_ms   = 33;
+ * (An earlier "lossless batch" attempt corrupted on large payloads, but that
+ * was the prompt-miss desync — fixed now, so batching is back, see the ring
+ * above and the drain in publish_frame.) */
+/* Publish cadence. With batching (every buffered sample packed per message)
+ * the goal is to stay well under the BG770A's ~10 QMTPUB/s AT-command ceiling,
+ * NOT to publish fast: ~5 Hz, each message carrying every sample received
+ * since the last. pace 150ms lands near that once per-publish UART TX + prompt
+ * time is added on top. Live-tunable via `modem pace <ms>`. */
+static int mdm_pub_pace_ms   = 150;
 static int mdm_prompt_tmo_ms = 200;
 
 void modem_set_pace(int ms)  { mdm_pub_pace_ms   = (ms < 0)  ? 0  : ms; }
@@ -727,24 +740,36 @@ int  modem_get_ptmo(void)    { return mdm_prompt_tmo_ms; }
 /* Returns: 1 = published, 0 = nothing to send, -1 = publish failed
  * (no ">" prompt — modem backlogged or MQTT session gone). step_ready
  * uses the -1 count to decide when to force a reconnect. */
+/* Max packets drained into one QMTPUB. Bounds the payload (128×16 = 2 KB, well
+ * within the BG770A's QMTPUB limit and ~178 ms of UART TX) and caps how much a
+ * backlog can balloon a single message. */
+#define MDM_BATCH_PUB_MAX 128
+
 static int publish_frame(void)
 {
-	/* Atomically grab and clear the valid bitmap. Anything that arrives
-	 * after this point lands in the next frame. */
-	uint32_t valid = (uint32_t)atomic_set(&snap_valid, 0);
-	if (valid == 0) return 0;
+	/* Snapshot the ring extent. The producer may keep appending past `head`
+	 * during the drain; those samples land in the next frame. */
+	uint16_t head = txr_head;
+	uint16_t tail = txr_tail;
+	uint16_t avail = (head - tail) & MDM_TXRING_MASK;
+	if (avail == 0) return 0;
 
-	/* Pack the valid slots back-to-back into a local buffer. n is
-	 * popcount(valid) up to MDM_SNAP_MAX. */
-	uint8_t out[MDM_SNAP_MAX * MDM_PKT_BYTES];
-	int n = 0;
-	for (int i = 0; i < MDM_SNAP_MAX; i++) {
-		if (valid & (1u << i)) {
-			memcpy(out + n * MDM_PKT_BYTES,
-			       snap_pkt[i], MDM_PKT_BYTES);
-			n++;
-		}
+	if (avail > MDM_BATCH_PUB_MAX) {
+		/* Backlog: drop the oldest overflow so the message stays bounded
+		 * and what we send is the most recent. */
+		tail = (tail + (avail - MDM_BATCH_PUB_MAX)) & MDM_TXRING_MASK;
+		avail = MDM_BATCH_PUB_MAX;
 	}
+
+	/* static, not on the stack: only the modem thread calls publish_frame,
+	 * and 2 KB would blow the 2 KB thread stack. */
+	static uint8_t out[MDM_BATCH_PUB_MAX * MDM_PKT_BYTES];
+	for (uint16_t i = 0; i < avail; i++)
+		memcpy(out + i * MDM_PKT_BYTES,
+		       txring[(tail + i) & MDM_TXRING_MASK], MDM_PKT_BYTES);
+	txr_tail = (tail + avail) & MDM_TXRING_MASK;   /* consume */
+
+	int n = avail;
 	int payload_len = n * MDM_PKT_BYTES;
 
 	const char *topic = cfg.topic[0] ? cfg.topic : "rideform/0/frame";
