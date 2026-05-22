@@ -164,7 +164,10 @@ static int uart_start_rx(void)
  *     (not just TCP) is dead — more reliable and faster than the modem's
  *     keepalive, and lighter to tune. */
 static const char       *mdm_ctrl_topic     = "rideform/0/ctrl";
-static volatile bool     mdm_publish_enabled = true;
+/* Default OFF: bring the modem + MQTT link up at boot and keep it warm, but
+ * don't stream tracker data (which costs cellular data continuously) until the
+ * Deck sends "start". The Deck shows a Start button until then. */
+static volatile bool     mdm_publish_enabled = false;
 static volatile bool     mdm_confirm_pending = false; /* send started/stopped */
 static volatile int64_t  mdm_last_pong_ms    = 0;   /* last ping echo seen */
 
