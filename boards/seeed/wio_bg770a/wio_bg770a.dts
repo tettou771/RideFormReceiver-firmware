@@ -66,7 +66,12 @@
 &uart1 {
 	compatible = "nordic,nrf-uarte";
 	status = "okay";
-	current-speed = <115200>;
+	/* 921600 with HW flow control: 8x the factory default, keeps headroom for
+	 * batched MQTT publishes at higher tracker rates so the modem thread
+	 * isn't blocked on UART when ESB busy-period steals CPU. The modem boots
+	 * at 115200 from factory; firmware auto-detects and writes
+	 * AT+IPR=921600;&W on first contact to make it stick. */
+	current-speed = <921600>;
 	hw-flow-control;
 	pinctrl-0 = <&uart1_default>;
 	pinctrl-1 = <&uart1_sleep>;

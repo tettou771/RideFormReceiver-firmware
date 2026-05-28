@@ -145,6 +145,48 @@ static int uart_start_rx(void)
 	return 0;
 }
 
+/* MCU<->modem UART baud. Target = high-speed steady state; fallback = BG770A
+ * factory default. Bootstrap (try_baud_bootstrap, below near at_probe_alive)
+ * auto-detects + persists 921600 with &W on first contact. */
+#define MDM_TARGET_BAUD   921600
+#define MDM_FALLBACK_BAUD 115200
+static int current_uart_baud = MDM_TARGET_BAUD;  /* matches DT current-speed */
+
+/* Switch the UART to a new baud. Caller is responsible for the modem's side
+ * being at (or about to switch to) the same rate — otherwise the link is dead
+ * until both ends realign. Stops RX, reconfigures, flushes stale bytes, restarts. */
+static int set_uart_baud(int baud)
+{
+	if (baud == current_uart_baud) return 0;
+
+	uart_rx_disable(uart_dev);
+	/* uart_rx_disable is async; wait for the UART_RX_DISABLED callback to
+	 * flip uart_rx_active before reconfiguring. */
+	int64_t deadline = k_uptime_get() + 200;
+	while (uart_rx_active && k_uptime_get() < deadline) k_msleep(5);
+
+	struct uart_config c = {
+		.baudrate  = baud,
+		.parity    = UART_CFG_PARITY_NONE,
+		.stop_bits = UART_CFG_STOP_BITS_1,
+		.data_bits = UART_CFG_DATA_BITS_8,
+		.flow_ctrl = UART_CFG_FLOW_CTRL_RTS_CTS,
+	};
+	int err = uart_configure(uart_dev, &c);
+	if (err) {
+		LOG_ERR("modem: uart_configure %d -> %d", baud, err);
+		(void)uart_start_rx();   /* try to recover RX */
+		return err;
+	}
+	current_uart_baud = baud;
+
+	/* Drop anything that crossed the baud change — it's garbage now. */
+	ring_buf_reset(&rx_ringbuf);
+	k_msgq_purge(&line_msgq);
+
+	return uart_start_rx();
+}
+
 /* Pull bytes out of the ring buffer and split into '\n'-terminated lines.
  * '\r' is dropped. Empty lines are skipped (BG770A pads responses with
  * "\r\n" both before and after).
@@ -431,8 +473,60 @@ static mdm_state_t step_off(void)
 
 static int consecutive_faults = 0;
 
+/* Called when AT was silent at the current (target) baud. If the modem turns
+ * out to be at factory 115200 (fresh module or NVM reset), set IPR to
+ * MDM_TARGET_BAUD with &W (persist), switch our UART up, and continue.
+ * Cost when modem is genuinely silent: ~5s extra per probe failure. */
+static bool try_baud_bootstrap(void)
+{
+	if (current_uart_baud != MDM_TARGET_BAUD) return false;
+
+	LOG_INF("modem: AT silent at %d — trying %d (factory)",
+	        MDM_TARGET_BAUD, MDM_FALLBACK_BAUD);
+	if (set_uart_baud(MDM_FALLBACK_BAUD) != 0) return false;
+
+	bool alive = false;
+	int64_t deadline = k_uptime_get() + 5000;
+	do {
+		at_send_line("AT");
+		if (at_wait_prefix("OK", NULL, 0, 800) == 0) { alive = true; break; }
+	} while (k_uptime_get() < deadline);
+
+	if (!alive) {
+		/* Modem really is off/wedged, not just baud-mismatched. Restore
+		 * target baud so normal escalation (PWRKEY/RESET) takes over. */
+		(void)set_uart_baud(MDM_TARGET_BAUD);
+		return false;
+	}
+
+	LOG_INF("modem: alive at %d — persisting IPR=%d;&W",
+	        MDM_FALLBACK_BAUD, MDM_TARGET_BAUD);
+	/* OK reply may come back at the NEW baud (Quectel switches on the stop
+	 * bit of the OK), so don't try to read it — push the command, give it a
+	 * moment, then switch and verify with a fresh probe. */
+	at_send_line("AT+IPR=921600;&W");
+	k_msleep(300);
+
+	if (set_uart_baud(MDM_TARGET_BAUD) != 0) return false;
+
+	deadline = k_uptime_get() + 2000;
+	do {
+		at_send_line("AT");
+		if (at_wait_prefix("OK", NULL, 0, 800) == 0) {
+			LOG_INF("modem: baud bootstrap OK — running at %d", MDM_TARGET_BAUD);
+			return true;
+		}
+	} while (k_uptime_get() < deadline);
+
+	LOG_WRN("modem: baud bootstrap: IPR set but no AT at %d", MDM_TARGET_BAUD);
+	return false;
+}
+
 /* Send AT every second for up to timeout_ms, return true on first "OK".
- * Used to detect whether the BG770A is alive *without* touching PWRKEY. */
+ * Used to detect whether the BG770A is alive *without* touching PWRKEY.
+ *
+ * Falls back to a baud bootstrap if the timeout expires: a factory-fresh
+ * BG770A is at 115200, which won't answer when we're at 921600. */
 static bool at_probe_alive(int timeout_ms)
 {
 	int64_t deadline = k_uptime_get() + timeout_ms;
@@ -440,7 +534,7 @@ static bool at_probe_alive(int timeout_ms)
 		at_send_line("AT");
 		if (at_wait_prefix("OK", NULL, 0, 1000) == 0) return true;
 	} while (k_uptime_get() < deadline);
-	return false;
+	return try_baud_bootstrap();
 }
 
 /* BG770A's PWRKEY is a toggle (pulse-while-OFF powers on, pulse-while-ON
@@ -1055,9 +1149,20 @@ static mdm_state_t step_ready(void)
 
 static mdm_state_t step_fault(void)
 {
-	consecutive_faults++;
-	LOG_WRN("modem: FAULT (consecutive=%d) — backing off 5s",
-	        consecutive_faults);
+	/* Distinguish "modem is broken" from "broker is unreachable". When the PDP
+	 * data link is up the modem is fine — the issue is upstream (broker down,
+	 * home internet flapping, etc.) and could last hours. Counting those
+	 * against the modem-escalation budget would soft-reboot the nRF after
+	 * ~4 min of broker-only outage, which fixes nothing. mqtt_fail_streak
+	 * already handles broker-side escalation (eventual AT+CFUN=1,1) with its
+	 * own longer threshold; let it own that lane. */
+	if (mdm_pdp_alive) {
+		LOG_INF("modem: FAULT (broker only, pdp alive) — backing off 5s");
+	} else {
+		consecutive_faults++;
+		LOG_WRN("modem: FAULT (consecutive=%d) — backing off 5s",
+		        consecutive_faults);
+	}
 	k_msleep(5000);
 	if (!start_requested) return MDM_OFF;
 
