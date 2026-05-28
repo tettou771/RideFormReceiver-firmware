@@ -63,6 +63,7 @@ int  modem_get_ptmo(void) { return 0; }
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/sys/reboot.h>
 
 /* ---- DT bindings ----------------------------------------------------- */
 
@@ -189,8 +190,16 @@ static void handle_qmtrecv(const char *line)
 	memcpy(payload, open + 1, n);
 	payload[n] = 0;
 
+	/* Any incoming MQTT message — our own ping loopback, the Deck's start/stop,
+	 * even garbled bytes from a desynced batch — proves the
+	 * broker -> modem -> nRF path is alive right now, so refresh the liveness
+	 * timer unconditionally. Otherwise the occasional LTE-dropped ping echo
+	 * piles up to 3 misses and trips a false reconnect even when the link is
+	 * fine and other traffic is flowing. */
+	mdm_last_pong_ms = k_uptime_get();
+
 	if (strncmp(payload, "ping:", 5) == 0) {
-		mdm_last_pong_ms = k_uptime_get();   /* round trip alive */
+		/* already accounted for above */
 	} else if (strcmp(payload, "start") == 0) {
 		mdm_publish_enabled = true;
 		mdm_confirm_pending = true;
@@ -217,6 +226,7 @@ static void rx_line_thread(void)
 					if (strncmp(buf, "+QMTRECV", 8) == 0) {
 						/* Control/ping URC — handle here, don't
 						 * enqueue (the state machine would discard it). */
+						LOG_INF("RX URC: %s", buf);  /* diag: see actual URC format */
 						handle_qmtrecv(buf);
 					} else {
 						char tmp[MDM_LINE_MAX];
@@ -454,12 +464,39 @@ static mdm_state_t step_boot_pwr(void)
 		return MDM_AT_CONFIG;
 	}
 
-	LOG_INF("modem: no AT response — pulsing PWRKEY");
-	gpio_pin_set_dt(&mdm_pwr, 1);
-	k_msleep(700);
-	gpio_pin_set_dt(&mdm_pwr, 0);
-	/* Quectel datasheet: ~13s from PWRKEY release to URC "RDY". */
-	k_msleep(13000);
+	/* Escalation. PWRKEY is a TOGGLE on the BG770A but the timing matters:
+	 * short pulse (~500ms) = power-ON spec; long pulse (>2s) = power-OFF spec.
+	 * A 700ms pulse on a module that's stuck "on but unresponsive" is a no-op,
+	 * which is why we used to loop forever. Step up by attempt count:
+	 *   1-2 fails: short PWRKEY (normal power-on attempt)
+	 *   3-4 fails: LONG PWRKEY (forces OFF) then short pulse to bring back on
+	 *   5+  fails: RESET pin — hardware-level reset, ignores modem state */
+	if (consecutive_faults <= 1) {
+		LOG_INF("modem: no AT response — short PWRKEY (try power-on)");
+		gpio_pin_set_dt(&mdm_pwr, 1);
+		k_msleep(700);
+		gpio_pin_set_dt(&mdm_pwr, 0);
+		k_msleep(13000);
+	} else if (consecutive_faults <= 3) {
+		LOG_WRN("modem: AT silent (fault=%d) — LONG PWRKEY to force OFF",
+		        consecutive_faults);
+		gpio_pin_set_dt(&mdm_pwr, 1);
+		k_msleep(3000);       /* >2s = shutdown spec */
+		gpio_pin_set_dt(&mdm_pwr, 0);
+		k_msleep(2000);       /* let it settle in OFF */
+		LOG_INF("modem: short PWRKEY to power back on");
+		gpio_pin_set_dt(&mdm_pwr, 1);
+		k_msleep(700);
+		gpio_pin_set_dt(&mdm_pwr, 0);
+		k_msleep(13000);
+	} else {
+		LOG_WRN("modem: AT silent (fault=%d) — RESET pin hard reset",
+		        consecutive_faults);
+		gpio_pin_set_dt(&mdm_rst, 1);
+		k_msleep(200);        /* hold reset asserted ~200ms */
+		gpio_pin_set_dt(&mdm_rst, 0);
+		k_msleep(13000);      /* let it boot back up */
+	}
 	(void)at_wait_prefix("RDY", NULL, 0, 500);
 	return MDM_AT_PROBE;
 }
@@ -956,8 +993,14 @@ static void mqtt_publish_text(const char *topic, const char *str)
 	int hl = snprintf(hdr, sizeof(hdr),
 		"AT+QMTPUB=0,0,0,0,\"%s\",%d\r", topic, sl);
 	at_send_raw((const uint8_t *)hdr, hl);
-	if (at_wait_prefix(">", NULL, 0, 500) == 0)
-		at_send_raw((const uint8_t *)str, sl);
+	/* Wait briefly for the data-input prompt — but send the payload either way.
+	 * Skipping it on a late/missed prompt leaves the modem in data mode waiting
+	 * for `sl` bytes; it then consumes the NEXT AT command's bytes as payload
+	 * and the publish stream desyncs (we saw the broker receive "AT+QMTP…" as
+	 * the body of a ping). publish_frame already does this for data; ping/
+	 * start/stop need the same protection. */
+	(void)at_wait_prefix(">", NULL, 0, 500);
+	at_send_raw((const uint8_t *)str, sl);
 }
 
 static mdm_state_t step_ready(void)
@@ -1018,6 +1061,23 @@ static mdm_state_t step_fault(void)
 	k_msleep(5000);
 	if (!start_requested) return MDM_OFF;
 
+	/* Last-resort self-heal: if we've been faulting for many minutes the
+	 * nRF-side state (UART driver, rx parser, modem stack) may be wedged in a
+	 * way the state machine can't clear (we've seen cases where only pressing
+	 * the physical RESET button recovered). Soft-reboot is the software
+	 * equivalent — pulled the plug ourselves rather than wait for a human. */
+	/* Each cycle is ~50s (5s backoff + 16s probe + 13s pulse wait + 15s probe),
+	 * so 5 failures ~ 4min — long enough that ordinary transients recover via
+	 * PWRKEY toggling first, short enough that a genuinely wedged nRF state
+	 * (UART driver, rx parser) gets cleared before the user reaches for the
+	 * physical reset button. */
+	if (consecutive_faults >= 7) {
+		LOG_WRN("modem: %d consecutive faults — soft-rebooting nRF",
+		        consecutive_faults);
+		k_msleep(100);   /* let the log line drain */
+		sys_reboot(SYS_REBOOT_COLD);
+	}
+
 	/* If the data link is still up (the broker-down case), skip the full
 	 * AT/registration re-walk and retry just the MQTT layer — lighter and
 	 * faster while we wait for the broker to come back. */
@@ -1061,6 +1121,10 @@ static void modem_thread(void)
 		case MDM_READY:      next = step_ready();      break;
 		case MDM_FAULT:
 		default:             next = step_fault();      break;
+		}
+		if (next != cur) {
+			LOG_INF("modem: state %s -> %s",
+			        state_names[cur], state_names[next]);
 		}
 		state = next;
 	}
