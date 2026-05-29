@@ -50,6 +50,13 @@
                                    * 0 means "back to firmware default".
                                    * RAM only on tracker side — a power
                                    * cycle reverts to the built-in rate. */
+#define RFT_CMD_SET_SLOT_INDEX  6 /* payload[0]: uint8 slot index (0..MAX_SENSORS-1).
+                                   * Tracker stores the value in NVS and uses it
+                                   * to anchor TDMA TX timing relative to the
+                                   * beacon. Pushed automatically after pair
+                                   * completes (see esb.c) and on the
+                                   * `broadcast_index` console command (see
+                                   * console.c). */
 
 #define RFT_CMD_NO_TARGET     0xFF
 
