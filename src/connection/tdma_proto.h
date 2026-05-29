@@ -19,10 +19,19 @@
 
 #include <stdint.h>
 
+/* Number of TDMA slots per cycle. This is the count of trackers we're
+ * willing to schedule; the receiver still supports MAX_TRACKERS=256 in
+ * its pairing table, but only the first TDMA_NUM_SLOTS get a slot —
+ * beyond that you'd be scheduling into sub-µs gaps and lose. Match
+ * the Deck's MAX_SENSORS=10. */
+#define TDMA_NUM_SLOTS         10
+
 /* Reserved packet markers (data[0]). Existing markers 0x00..0x09 belong to
  * the tracker→receiver pkt0..pkt9 series; the 0xFx range is for
  * receiver→tracker control. */
-#define PKT_TDMA_BEACON       0xFB   /* receiver broadcast, all trackers RX */
+#define PKT_TDMA_BEACON       0xFB   /* TIMING ACK byte[0] marker (legacy
+                                      * name from the abandoned PTX-beacon
+                                      * design — kept for the constant value) */
 
 /* Beacon payload format. Single 16-byte ESB packet, fits in one TX.
  * Trackers read this on every beacon and re-anchor their slot timing —
