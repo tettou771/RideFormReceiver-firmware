@@ -210,7 +210,8 @@ static void print_help(void)
 	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
 	printk("rate <id|all> <Hz>           Cap tracker TX rate (RAM only, 0=default)\n");
 	printk("\nmodem status                 Show modem state and MQTT settings\n");
-	printk("modem start | stop           Bring up / tear down LTE link\n");
+	printk("modem on | off               Enable / disable LTE MQTT publish (USB HID stays on)\n");
+	printk("modem start | stop           Aliases of on/off\n");
 	printk("modem at <command>           Raw AT passthrough (debug)\n");
 	printk("modem apn <name>             Set APN (NVS)\n");
 	printk("modem broker <host> <port>   Set MQTT broker (NVS)\n");
@@ -394,18 +395,18 @@ static void console_thread(void)
 			/* RFT: BG770A modem control (wio_bg770a board only — stubs
 			 * elsewhere). Subcommands mirror QMTOPEN/QMTCONN params. */
 			if (argc < 2) {
-				printk("Usage: modem status|start|stop|at|apn|broker|client|topic|user|pass|pace|ptmo ...\n");
+				printk("Usage: modem status|on|off|start|stop|at|apn|broker|client|topic|user|pass|pace|ptmo ...\n");
 				continue;
 			}
 			strtolower(argv[1]);
 			if (strcmp(argv[1], "status") == 0) {
 				modem_console_status();
-			} else if (strcmp(argv[1], "start") == 0) {
+			} else if (strcmp(argv[1], "start") == 0 || strcmp(argv[1], "on") == 0) {
 				modem_request_start();
-				printk("modem start requested\n");
-			} else if (strcmp(argv[1], "stop") == 0) {
+				printk("modem on — LTE attach starting (USB HID continues in parallel)\n");
+			} else if (strcmp(argv[1], "stop") == 0 || strcmp(argv[1], "off") == 0) {
 				modem_request_stop();
-				printk("modem stopped\n");
+				printk("modem off — USB HID only\n");
 			} else if (strcmp(argv[1], "at") == 0) {
 				if (argc < 3) { printk("Usage: modem at <cmd>\n"); continue; }
 				/* Re-join argv[2..] in case the user typed spaces. */

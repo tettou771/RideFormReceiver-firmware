@@ -1220,13 +1220,13 @@ static void modem_thread(void)
 	gpio_pin_configure_dt(&mdm_rst, GPIO_OUTPUT_INACTIVE);
 	(void)uart_start_rx();
 
-	/* Autostart: bring the LTE link up on boot without waiting for a
-	 * `modem start` console command — the receiver runs headless in the
-	 * field (no laptop). Short settle delay lets ESB + USB CDC enumerate
-	 * first. `modem stop` still halts it (start_requested=false). */
+	/* RFT 2026-05-29: autostart disabled. The Wio receiver now defaults to
+	 * USB-HID forwarding only (modem dormant) so the modem-bypass baseline
+	 * can be measured side-by-side. Bring the LTE link up explicitly with
+	 * `modem on` (or `modem start`) on the console. Non-persistent — every
+	 * boot starts in modem-off mode. */
 	k_msleep(2000);
-	start_requested = true;
-	LOG_INF("modem: autostart");
+	LOG_INF("modem: dormant — type `modem on` to bring up LTE");
 
 	while (1) {
 		mdm_state_t cur = state;
