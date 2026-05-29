@@ -1,51 +1,81 @@
 /*
-    RFT TDMA scheduler (receiver side).
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 Eiren Rain & SlimeVR Contributors
 
-    Maintains the cycle clock (when the current cycle started, what
-    cycle_counter it is, what the per-rate slot_stride is) and packs the
-    TIMING ACK payload delivered to trackers via the ESB ACK FIFO. See
-    PLAN_tdma.md for the design and the ACK byte[0]=0xFB marker.
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
 
-    Replaces an unused upstream slimevr-receiver stub. None of its
-    symbols are referenced anywhere else.
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
 */
-#ifndef RFT_TDMA_H
-#define RFT_TDMA_H
-
 #include <stdint.h>
-#include <stdbool.h>
-#include "tdma_proto.h"   /* TDMA_NUM_SLOTS, PKT_TDMA_BEACON marker */
+#include "globals.h"
 
-/* Bring up the cycle clock + 1 kHz refresh thread. Safe to call from
- * main() after esb is initialised. */
-void tdma_init(void);
+#define TDMA_TIMER_SIZE 32768
+#define TDMA_WINDOW_SIZE 16
+#define TDMA_WINDOWS_COUNT 2048
+#define TDMA_WINDOWS_SHIFT 11
+#define TDMA_MAX_TRACKERS 32
 
-/* Switch the cycle rate. Recomputes head_offset/stride/cycle_period
- * from the new rate. hz==0 reverts to the firmware default (30 Hz).
- * Effective on the next refresh tick (≤1 ms). Called from the receiver
- * console `rate <hz>` and from the Deck-driven rate cmd. */
-void tdma_set_rate_hz(uint8_t hz);
-uint8_t tdma_get_rate_hz(void);
+uint8_t tdma_tracker_slots = 8;
+uint8_t tdma_window_allocations = 256; // not used anywhere
+int8_t tdma_tracker_id_to_slot[MAX_TRACKERS] = {-1};
+uint8_t tdma_next_tracker_slot = 0;
 
-/* Pack a TIMING ACK payload at out[0..11] (12 bytes — must match
- * tx_payload_sync.length in esb.c). Layout:
- *   [0]   = 0xFB (TDMA TIMING marker — safe because the CMD ACK's
- *           byte[0] is the led_clock high byte and only reaches 0x0D)
- *   [1..3]= us_until_next_cycle_start (24-bit LE), refreshed at call
- *           time so the value the tracker reads is at most ~1 ms stale
- *   [4..5]= cycle_counter low 16 bits (LE) — drives housekeeping rotation
- *   [6..7]= slot_stride_us (16-bit LE)
- *   [8]   = head_offset_us / 8 (0..255 ⇒ 0..2040 µs in 8 µs steps)
- *   [9]   = num_slots (= MAX_SENSORS, informational)
- *   [10]  = reserved (0)
- *   [11]  = XOR checksum of [0..10]
- */
-void tdma_pack_timing_ack(uint8_t out[12]);
+bool tdma_adjust_window_size(uint8_t trackers_amount) {
+    if(trackers_amount <= 8)
+        tdma_tracker_slots = 8;
+    else if(trackers_amount <= 16)
+        tdma_tracker_slots = 16;
+    else
+        tdma_tracker_slots = 32;
+    tdma_window_allocations = TDMA_WINDOWS_COUNT / tdma_tracker_slots;
+    return trackers_amount <= tdma_tracker_slots;
+}
 
-/* True when the next ACK slot should carry a CMD instead of TIMING.
- * Current policy: when rft_cmd_peek_next() reports a queued cmd, OR
- * once every ~20 ticks (~20 ms at 1 kHz) so the global mag-stream
- * flag keeps refreshing on every tracker. */
-bool tdma_should_send_cmd_ack(void);
+uint16_t tdma_get_window_from_timer(uint16_t timer) {
+    return timer >> TDMA_WINDOWS_SHIFT;
+}
 
-#endif
+uint8_t tdma_get_tracker_slot_from_timer(uint16_t timer) {
+    return tdma_get_window_from_timer(timer) % tdma_tracker_slots;
+}
+
+uint16_t tdma_get_tracker_slot_error(uint16_t timer, uint8_t tracker_slot) {
+    uint8_t correct_tracker = tdma_get_tracker_slot_from_timer(timer);
+    if(correct_tracker == tracker_slot)
+        return 0;
+    while(correct_tracker < tracker_slot) // We always go to the future
+        correct_tracker += tdma_tracker_slots;
+    return timer - (correct_tracker - tracker_slot) * TDMA_WINDOW_SIZE;
+}
+
+int8_t tdma_tracker_slot_from_id(uint8_t tracker_id) {
+    return tdma_tracker_id_to_slot[tracker_id];
+}
+
+int8_t tdma_insert_tracker(uint8_t tracker_id) {
+    int8_t current_slot = tdma_tracker_slot_from_id(tracker_id);
+    if(current_slot >= 0)
+        return current_slot;
+    if(!tdma_adjust_window_size(tdma_next_tracker_slot + 1))
+        return -1;
+    tdma_tracker_id_to_slot[tracker_id] = tdma_next_tracker_slot;
+    return tdma_next_tracker_slot++;
+}
+
+bool tdma_is_dongle_order(uint16_t timer) {
+    return tdma_get_window_from_timer(timer) < tdma_tracker_slots;
+}

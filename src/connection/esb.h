@@ -40,10 +40,6 @@ void esb_reset_pair(void);
 void esb_finish_pair(void);
 void esb_clear(void);
 void esb_write_sync(uint16_t led_clock);
-/* RFT TDMA: enqueue a TIMING ACK (byte[0]=0xFB) into the ACK FIFO.
- * Called by the 1 kHz tdma_sync_thread in timer.c. The payload is
- * packed at call time so us_until_next_cycle is fresh as of enqueue. */
-void esb_write_tdma_timing(void);
 void esb_receive(void);
 
 #endif

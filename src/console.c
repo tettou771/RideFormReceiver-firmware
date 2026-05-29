@@ -26,7 +26,6 @@
 #include "parse_args.h"
 #include "connection/cmd_queue.h"
 #include "connection/modem.h"
-#include "connection/tdma.h"
 
 #include <stdlib.h>  /* strtof */
 #include <math.h>    /* roundf */
@@ -209,8 +208,7 @@ static void print_help(void)
 	printk("clear_mag_bias <id|all>      Clear mag bias on tracker (NVS too)\n");
 	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
 	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
-	printk("rate <id|all> <Hz>           Cap tracker TX rate. \"all\" also sets the TDMA cycle rate (RAM only, 0=default)\n");
-	printk("broadcast_index              Resend SET_SLOT_INDEX to every paired tracker (recovery after tracker NVS wipe)\n");
+	printk("rate <id|all> <Hz>           Cap tracker TX rate (RAM only, 0=default)\n");
 	printk("\nmodem status                 Show modem state and MQTT settings\n");
 	printk("modem start | stop           Bring up / tear down LTE link\n");
 	printk("modem at <command>           Raw AT passthrough (debug)\n");
@@ -380,43 +378,16 @@ static void console_thread(void)
 		}
 		else if (strcmp(argv[0], "rate") == 0)
 		{
-			/* RFT: cap tracker TX rate. When "all" is the target this is
-			 * also the TDMA cycle rate — the receiver itself starts a new
-			 * cycle period and broadcasts it via TIMING ACKs. Per-tracker
-			 * rate is kept as a hint for the tracker's fusion loop but
-			 * the actual TX timing comes from the TDMA schedule. RAM only,
-			 * power cycle reverts. */
+			/* RFT: cap a tracker's TX rate (RAM only, reverts on power
+			 * cycle). 0 means "back to firmware default". */
 			if (argc != 3) { printk("Usage: rate <id|all> <Hz 0-255>\n"); continue; }
 			int hz = (int)parse_i32(argv[2], 10);
 			if (hz < 0 || hz > 255) { printk("Hz out of range (0-255)\n"); continue; }
 			rft_cmd_t cmd = { .type = RFT_CMD_SET_MAX_RATE_HZ };
 			cmd.data[0] = (uint8_t)hz;
 			int n = rft_enqueue_for(argv[1], &cmd);
-			if (n < 0) { printk("Bad target id\n"); continue; }
-			if (strcmp(argv[1], "all") == 0) {
-				tdma_set_rate_hz((uint8_t)hz);
-				printk("TDMA cycle now %uHz; queued SET_MAX_RATE_HZ to %d tracker(s)\n",
-				       tdma_get_rate_hz(), n);
-			} else {
-				printk("Queued rate=%dHz for %d tracker(s) (TDMA cycle unchanged at %uHz)\n",
-				       hz, n, tdma_get_rate_hz());
-			}
-		}
-		else if (strcmp(argv[0], "broadcast_index") == 0)
-		{
-			/* RFT TDMA: push SET_SLOT_INDEX to every paired tracker so each
-			 * one learns its position in our paired_addr[] table. Use this
-			 * when a tracker's NVS was wiped, after firmware update, or
-			 * when re-ordering the table — avoids a physical re-pair dance.
-			 * Indices are the position in stored_trackers (0..N-1). */
-			int n = 0;
-			for (uint8_t i = 0; i < stored_trackers && i < TDMA_NUM_SLOTS; i++) {
-				rft_cmd_t cmd = { .type = RFT_CMD_SET_SLOT_INDEX };
-				cmd.data[0] = i;
-				if (rft_cmd_push(i, &cmd)) n++;
-			}
-			printk("Queued SET_SLOT_INDEX for %d/%d paired tracker(s)\n",
-			       n, stored_trackers);
+			if (n < 0) printk("Bad target id\n");
+			else printk("Queued rate=%dHz for %d tracker(s)\n", hz, n);
 		}
 		else if (strcmp(argv[0], "modem") == 0)
 		{

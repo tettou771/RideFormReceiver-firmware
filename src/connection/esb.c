@@ -24,7 +24,6 @@
 #include "system/system.h"
 #include "hid.h"
 #include "tdma.h"
-#include "tdma_proto.h"
 
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/sys/crc.h>
@@ -405,17 +404,6 @@ void esb_add_pair(uint64_t addr, bool checksum)
 		sys_write(STORED_ADDR_0 + id, NULL, &stored_tracker_addr[id], sizeof(stored_tracker_addr[0]));
 		stored_trackers++;
 		sys_write(STORED_TRACKERS, NULL, &stored_trackers, sizeof(stored_trackers));
-
-		/* RFT TDMA: queue SET_SLOT_INDEX so the new tracker learns its
-		 * slot position immediately, without needing a console
-		 * `broadcast_index`. Only meaningful for the first TDMA_NUM_SLOTS
-		 * trackers; anything beyond is paired but unschedulable. */
-		if (id < TDMA_NUM_SLOTS) {
-			rft_cmd_t cmd = { .type = RFT_CMD_SET_SLOT_INDEX };
-			cmd.data[0] = (uint8_t)id;
-			(void)rft_cmd_push((uint8_t)id, &cmd);
-			LOG_INF("TDMA: queued SET_SLOT_INDEX=%d for new tracker", id);
-		}
 	}
 	else
 	{
@@ -542,24 +530,6 @@ void esb_clear(void)
 	sys_write(STORED_TRACKERS, NULL, &stored_trackers, sizeof(stored_trackers));
 	LOG_INF("NVS Reset");
 	esb_reset_pair();
-}
-
-// RFT: queue a TDMA TIMING ACK as the next ACK payload. Same delivery
-// mechanism as esb_write_sync below — ESB hardware auto-attaches the
-// queued payload to the next tracker's outgoing ACK. Trackers branch on
-// data[0]=0xFB to parse this as TDMA timing instead of a CMD ACK.
-//
-// See tdma.c for the cycle clock and us_until_next_cycle computation.
-void esb_write_tdma_timing(void)
-{
-	if (!esb_initialized || !esb_paired)
-		return;
-	tx_payload_sync.pipe = 1;
-	tx_payload_sync.noack = false;
-	tx_payload_sync.length = 12;
-	tdma_pack_timing_ack(tx_payload_sync.data);
-	int err = esb_write_payload(&tx_payload_sync);
-	(void)err;  /* -ENOMEM is expected when FIFO is still hot from previous write */
 }
 
 // RFT: queue the next sync as an ACK payload.
