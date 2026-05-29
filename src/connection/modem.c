@@ -411,6 +411,7 @@ static uint8_t           txring[MDM_TXRING_SZ][MDM_PKT_BYTES];
 static volatile uint16_t txr_head;    /* producer (ISR) advances */
 static volatile uint16_t txr_tail;    /* consumer (modem thread) advances */
 static volatile uint32_t txr_dropped; /* ring-full drops, diagnostics */
+static volatile uint32_t txr_enq;     /* enqueues (= ESB packets handed off) */
 
 bool modem_enqueue_tracker_packet(const uint8_t *pkt16)
 {
@@ -425,6 +426,7 @@ bool modem_enqueue_tracker_packet(const uint8_t *pkt16)
 	}
 	memcpy(txring[head], pkt16, MDM_PKT_BYTES);
 	txr_head = next;   /* publish the slot only after it is fully written */
+	txr_enq++;
 	return true;
 }
 
@@ -1055,8 +1057,24 @@ maybe_log:
 		int64_t now = k_uptime_get();
 		if (now - s_last_log_ms > 1000) {
 			s_last_log_ms = now;
-			LOG_INF("modem: pub ok=%d prompt_miss=%d pkts=%d",
-			        s_pub_ok, s_pub_prompt_miss, s_pkts_sent);
+			/* Ring-backlog snapshot AT THE MOMENT OF LOGGING. If this number
+			 * sits >0 the modem can't keep up with ESB (raise UART / lower
+			 * tracker rate); near 128 means we're hitting MDM_BATCH_PUB_MAX
+			 * and chopping off the oldest samples in publish_frame. */
+			uint16_t backlog = (txr_head - txr_tail) & MDM_TXRING_MASK;
+			/* Deltas since the last log line: produced vs consumed, and
+			 * "lost in the ring" (overflow when consumer can't drain fast
+			 * enough — this drop happens BEFORE MQTT, so QoS can't help). */
+			static uint32_t s_last_enq = 0, s_last_drop = 0;
+			uint32_t enq_now  = txr_enq;
+			uint32_t drop_now = txr_dropped;
+			uint32_t enq_d  = enq_now  - s_last_enq;
+			uint32_t drop_d = drop_now - s_last_drop;
+			s_last_enq  = enq_now;
+			s_last_drop = drop_now;
+			LOG_INF("modem: pub ok=%d prompt_miss=%d pkts=%d | enq=%u drop=%u backlog=%u",
+			        s_pub_ok, s_pub_prompt_miss, s_pkts_sent,
+			        enq_d, drop_d, backlog);
 			s_pub_ok = 0;
 			s_pub_prompt_miss = 0;
 			s_pkts_sent = 0;
