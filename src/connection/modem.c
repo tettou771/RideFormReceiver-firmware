@@ -837,8 +837,15 @@ static mdm_state_t step_mqtt_open(void)
 		LOG_INF("modem: %s", line);
 		mdm_pdp_alive = true;   /* data link up — a QMTOPEN fail = broker, not radio */
 	} else {
-		LOG_WRN("modem: no PDP context active");
+		/* PDP dropped — common after a weak-signal stall (the prompt_miss
+		 * spiral that precedes the ping-echo timeout). QMTOPEN below would
+		 * just fail with result=3 ("PDP not active") and bounce us right
+		 * back to MQTT_OPEN, looping forever without ever re-running
+		 * AT+QIACT=1. Go back to PDP_ACT to re-activate the context first;
+		 * it returns here once the data link is up again. */
+		LOG_WRN("modem: no PDP context active — re-activating PDP");
 		mdm_pdp_alive = false;
+		return MDM_PDP_ACT;
 	}
 
 	/* Try a ping to the broker host — this exercises DNS resolution AND
