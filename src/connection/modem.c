@@ -961,10 +961,13 @@ static mdm_state_t step_mqtt_conn(void)
  * above and the drain in publish_frame.) */
 /* Publish cadence. With batching (every buffered sample packed per message)
  * the goal is to stay well under the BG770A's ~10 QMTPUB/s AT-command ceiling,
- * NOT to publish fast: ~5 Hz, each message carrying every sample received
- * since the last. pace 150ms lands near that once per-publish UART TX + prompt
- * time is added on top. Live-tunable via `modem pace <ms>`. */
-static int mdm_pub_pace_ms   = 150;
+ * NOT to publish fast: each message carries every sample received since the
+ * last. pace 300ms = ~3.3 Hz publish, ~90 packets/message at 10 trackers × 30
+ * Hz (well under the 128-packet MDM_BATCH_PUB_MAX). Halves the QMTPUB/AT
+ * handshake rate vs 150ms while still sending every sample — chosen to reduce
+ * the handshake load that correlated with PDP-drop disconnects in the field.
+ * Live-tunable via `modem pace <ms>`. */
+static int mdm_pub_pace_ms   = 300;
 static int mdm_prompt_tmo_ms = 200;
 
 void modem_set_pace(int ms)  { mdm_pub_pace_ms   = (ms < 0)  ? 0  : ms; }
