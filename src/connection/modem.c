@@ -837,15 +837,30 @@ static mdm_state_t step_mqtt_open(void)
 		LOG_INF("modem: %s", line);
 		mdm_pdp_alive = true;   /* data link up — a QMTOPEN fail = broker, not radio */
 	} else {
-		/* PDP dropped — common after a weak-signal stall (the prompt_miss
-		 * spiral that precedes the ping-echo timeout). QMTOPEN below would
-		 * just fail with result=3 ("PDP not active") and bounce us right
-		 * back to MQTT_OPEN, looping forever without ever re-running
-		 * AT+QIACT=1. Go back to PDP_ACT to re-activate the context first;
-		 * it returns here once the data link is up again. */
-		LOG_WRN("modem: no PDP context active — re-activating PDP");
-		mdm_pdp_alive = false;
-		return MDM_PDP_ACT;
+		/* PDP dropped — common after a weak-signal stall. QMTOPEN below would
+		 * fail with result=3 ("PDP not active"), so re-activate the context
+		 * here first. IMPORTANT: do NOT route through MDM_PDP_ACT on failure —
+		 * PDP_ACT->FAULT->BOOT_PWR resets consecutive_faults at the AT probe
+		 * and never touches mqtt_fail_streak, so a persistently-dead radio
+		 * (e.g. no coverage) would loop forever and never hit the CFUN reset.
+		 * Re-activate in place; if it still won't come up, fall through to
+		 * mqtt_fail() so the escalation/reboot path actually runs. */
+		LOG_WRN("modem: no PDP context — re-activating in place");
+		at_send_line("AT+QIACT=1");
+		bool reactivated = false;
+		if (at_wait_prefix("OK", NULL, 0, 60000) == 0) {
+			at_send_line("AT+QIACT?");
+			if (at_wait_prefix("+QIACT:", line, sizeof(line), 5000) == 0) {
+				LOG_INF("modem: %s (re-activated)", line);
+				mdm_pdp_alive = true;
+				reactivated = true;
+			}
+		}
+		if (!reactivated) {
+			LOG_WRN("modem: PDP re-activation failed — escalating");
+			mdm_pdp_alive = false;
+			return mqtt_fail();
+		}
 	}
 
 	/* Try a ping to the broker host — this exercises DNS resolution AND
