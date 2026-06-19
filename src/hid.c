@@ -22,6 +22,7 @@
 */
 #include "globals.h"
 #include "hid.h"
+#include "cdc_forward.h"
 
 #if IS_ENABLED(CONFIG_USB_DEVICE_HID)
 
@@ -364,6 +365,10 @@ void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 	// which has its own signal-quality semantics).
 	if (data[0] != 1 && data[0] != 4 && data[0] != 9)
 		report.data[15] = rssi;
+	/* RFT: mirror the packet out the CDC ACM forward port (no-op stub on
+	 * boards without a `cdc_acm_fwd` DT node). Done before the FIFO push
+	 * so both paths see exactly the same 16 bytes. */
+	cdc_forward_write_packet(report.data);
 	// Get current FIFO status atomically
 	size_t write_idx = (size_t)atomic_get(&report_write_index);
 	size_t read_idx = (size_t)atomic_get(&report_read_index);
@@ -405,8 +410,11 @@ void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 // callback (see src/connection/modem.c).
 void hid_write_packet_n(uint8_t *data, uint8_t rssi)
 {
-	(void)data;
 	(void)rssi;
+	/* RFT: even on HID-less builds the CDC forward port can be active,
+	 * so mirror the packet through. cdc_forward itself is a stub when
+	 * the DT node is absent. */
+	cdc_forward_write_packet(data);
 }
 
 #endif /* CONFIG_USB_DEVICE_HID */

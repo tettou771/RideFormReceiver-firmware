@@ -47,3 +47,14 @@
 &nfct {
 	status = "disabled";
 };
+
+/* RFT: second CDC ACM instance dedicated to packet forwarding (16-byte
+ * SlimeVR HID-shape frames, back-to-back). The first instance (console)
+ * is provided by zephyr's cdc_acm_serial.dtsi as `board_cdc_acm_uart`.
+ * Android hosts can read packets via usb-serial-for-android — there is
+ * no clean USB HID class path without root. */
+&zephyr_udc0 {
+	cdc_acm_fwd: cdc_acm_fwd {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

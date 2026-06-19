@@ -26,6 +26,7 @@
 #include "parse_args.h"
 #include "connection/cmd_queue.h"
 #include "connection/modem.h"
+#include "cdc_forward.h"
 
 #include <stdlib.h>  /* strtof */
 #include <math.h>    /* roundf */
@@ -209,6 +210,7 @@ static void print_help(void)
 	printk("mag_recal <id|all>           Reset mag cal RAM state (NVS bias kept)\n");
 	printk("mag_stream <0|1>             Toggle raw-mag streaming on ALL paired trackers\n");
 	printk("rate <id|all> <Hz>           Cap tracker TX rate (RAM only, 0=default)\n");
+	printk("enable_cdc_forward <0|1>     Toggle CDC packet forwarding (persisted, default ON)\n");
 	printk("\nmodem status                 Show modem state and MQTT settings\n");
 	printk("modem on | off               Enable / disable LTE MQTT publish (USB HID stays on)\n");
 	printk("modem start | stop           Aliases of on/off\n");
@@ -389,6 +391,25 @@ static void console_thread(void)
 			int n = rft_enqueue_for(argv[1], &cmd);
 			if (n < 0) printk("Bad target id\n");
 			else printk("Queued rate=%dHz for %d tracker(s)\n", hz, n);
+		}
+		else if (strcmp(argv[0], "enable_cdc_forward") == 0)
+		{
+			/* RFT: toggle the CDC ACM packet forwarder. Default ON,
+			 * persisted to NVS — the new CDC port is invisible to
+			 * hosts that don't open it, so leaving it on costs
+			 * nothing on Mac (HID consumer) builds. */
+			if (argc != 2) {
+				printk("Usage: enable_cdc_forward <0|1>\n");
+				printk("(current: %d)\n", (int)cdc_forward_is_enabled());
+				continue;
+			}
+			int onoff = (int)parse_i32(argv[1], 10);
+			if (onoff != 0 && onoff != 1) {
+				printk("Bad on/off (use 0 or 1)\n");
+				continue;
+			}
+			cdc_forward_set_enabled(onoff != 0);
+			printk("enable_cdc_forward=%d\n", onoff);
 		}
 		else if (strcmp(argv[0], "modem") == 0)
 		{
