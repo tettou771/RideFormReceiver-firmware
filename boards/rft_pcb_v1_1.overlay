@@ -1,0 +1,11 @@
+/* RFT: second CDC ACM instance dedicated to packet forwarding (16-byte
+ * SlimeVR HID-shape frames, back-to-back). The first instance is
+ * cdc_acm_uart0 declared in the board DTS. Android hosts read packets
+ * from this second endpoint (usb-serial-for-android — no clean USB HID
+ * class path without root). Matches xiao_ble.overlay's cdc_acm_fwd node.
+ */
+&zephyr_udc0 {
+	cdc_acm_fwd: cdc_acm_fwd {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
